@@ -303,6 +303,9 @@ async def record_match_result(
     score: Optional[Literal["2-0", "2-1"]] = None
 ):
     """Enregistrer le résultat d'un match avec gestion des dodges"""
+    # Répondre immédiatement pour éviter l'expiration
+    await interaction.response.send_message("⏳ Traitement du match en cours...", ephemeral=True)
+    
     winners = [gagnant1, gagnant2, gagnant3]
     losers = [perdant1, perdant2, perdant3]
     
@@ -311,14 +314,12 @@ async def record_match_result(
     unique_ids = set(member.id for member in all_members)
     
     if len(unique_ids) != 6:
-        await interaction.response.send_message("❌ Erreur: Chaque joueur ne peut apparaître qu'une seule fois", 
-                                               ephemeral=True, suppress_embeds=True)
+        await interaction.edit_original_response(content="❌ Erreur: Chaque joueur ne peut apparaître qu'une seule fois")
         return
     
     # Vérifier que le dodge_joueur fait partie des 6 joueurs
     if dodge_joueur and dodge_joueur not in all_members:
-        await interaction.response.send_message("❌ Erreur: Le joueur qui a dodge doit faire partie des 6 joueurs du match", 
-                                               ephemeral=True, suppress_embeds=True)
+        await interaction.edit_original_response(content="❌ Erreur: Le joueur qui a dodge doit faire partie des 6 joueurs du match")
         return
     
     # Vérifier que tous sont inscrits
@@ -343,8 +344,7 @@ async def record_match_result(
         if player:
             winner_elos.append(player['elo'])
         else:
-            await interaction.response.send_message("❌ Erreur: Impossible de récupérer les données des joueurs", 
-                                                   ephemeral=True, suppress_embeds=True)
+            await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer les données des joueurs")
             return
     
     for member in losers:
@@ -352,8 +352,7 @@ async def record_match_result(
         if player:
             loser_elos.append(player['elo'])
         else:
-            await interaction.response.send_message("❌ Erreur: Impossible de récupérer les données des joueurs", 
-                                                   ephemeral=True, suppress_embeds=True)
+            await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer les données des joueurs")
             return
     
     winner_avg = sum(winner_elos) / 3
@@ -425,7 +424,9 @@ async def record_match_result(
         message += f"• Coéquipiers protégés: -70% perte\n"
         message += f"• Gagnants: -20% gain"
     
-    await interaction.response.send_message(message, suppress_embeds=True)
+    # Envoyer le message final dans le canal (pas en éphémère)
+    await interaction.followup.send(message, suppress_embeds=True)
+    await interaction.edit_original_response(content="✅ Match traité avec succès!")
 
 async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
                              loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
