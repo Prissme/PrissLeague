@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Ultra Simplifié - FICHIER PRINCIPAL
-Configuration, base de données et lancement du bot avec système de dodge
+Configuration, base de données et lancement du bot avec système de dodge corrigé
 """
 
 import discord
@@ -150,6 +150,15 @@ def init_db():
                 )
             ''')
             
+            # Table pour l'historique des matchs (pour l'undo)
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS match_history (
+                    id SERIAL PRIMARY KEY,
+                    match_data TEXT NOT NULL,
+                    match_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             # Insérer une ligne pour le cooldown si elle n'existe pas
             c.execute('''
                 INSERT INTO lobby_cooldown (id, last_creation) 
@@ -202,8 +211,29 @@ def create_player(discord_id, name):
     finally:
         conn.close()
 
+def update_player_elo_only(discord_id, new_elo):
+    """Met à jour SEULEMENT l'ELO d'un joueur (pas les win/loss)"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                UPDATE players 
+                SET elo = %s 
+                WHERE discord_id = %s
+            ''', (new_elo, str(discord_id)))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur update_player_elo_only: {e}")
+        return False
+    finally:
+        conn.close()
+
 def update_player_elo(discord_id, new_elo, won):
-    """Met à jour l'ELO d'un joueur"""
+    """Met à jour l'ELO d'un joueur (ANCIENNE VERSION - gardée pour compatibilité)"""
     conn = get_connection()
     if not conn:
         return False
@@ -248,7 +278,7 @@ def get_leaderboard():
         conn.close()
 
 def record_dodge(discord_id):
-    """Enregistre un dodge pour un joueur"""
+    """Enregistre UN SEUL dodge pour un joueur"""
     conn = get_connection()
     if not conn:
         return False
@@ -285,6 +315,149 @@ def get_player_dodge_count(discord_id):
     except Exception as e:
         logger.error(f"Erreur get_player_dodge_count: {e}")
         return 0
+    finally:
+        conn.close()
+
+def save_match_history(winners, losers, winner_elo_changes, loser_elo_changes, dodge_player_id=None):
+    """Sauvegarde l'historique d'un match pour permettre l'annulation"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            # Convertir les listes en JSON string
+            import json
+            
+            match_data = {
+                'winners': [str(w.id) for w in winners],
+                'losers': [str(l.id) for l in losers],
+                'winner_elo_changes': winner_elo_changes,
+                'loser_elo_changes': loser_elo_changes,
+                'dodge_player_id': str(dodge_player_id) if dodge_player_id else None,
+                'winner_team_leader': str(winners[0].id),  # Pour les win/loss d'équipe
+                'loser_team_leader': str(losers[0].id)
+            }
+            
+            c.execute('''
+                INSERT INTO match_history (match_data) 
+                VALUES (%s)
+            ''', (json.dumps(match_data),))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur save_match_history: {e}")
+        return False
+    finally:
+        conn.close()
+
+def undo_last_match():
+    """Annule le dernier match enregistré"""
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            # Récupérer le dernier match
+            c.execute('''
+                SELECT * FROM match_history 
+                ORDER BY match_date DESC 
+                LIMIT 1
+            ''')
+            last_match = c.fetchone()
+            
+            if not last_match:
+                return False, "Aucun match à annuler"
+            
+            import json
+            match_data = json.loads(last_match['match_data'])
+            
+            # Annuler les changements d'ELO pour les gagnants (sans retirer de victoires individuelles)
+            winners = match_data['winners']
+            winner_changes = match_data['winner_elo_changes']
+            
+            for i, player_id in enumerate(winners):
+                old_change = winner_changes[i]
+                # Inverser le changement d'ELO seulement
+                c.execute('''
+                    UPDATE players 
+                    SET elo = elo - %s
+                    WHERE discord_id = %s
+                ''', (old_change, player_id))
+            
+            # Annuler les changements d'ELO pour les perdants (sans retirer de défaites individuelles)
+            losers = match_data['losers']
+            loser_changes = match_data['loser_elo_changes']
+            
+            for i, player_id in enumerate(losers):
+                old_change = loser_changes[i]
+                # Inverser le changement d'ELO seulement
+                c.execute('''
+                    UPDATE players 
+                    SET elo = elo - %s
+                    WHERE discord_id = %s
+                ''', (old_change, player_id))
+            
+            # Retirer 1 victoire à l'équipe gagnante (leader seulement)
+            winner_leader = match_data.get('winner_team_leader', winners[0])
+            c.execute('''
+                UPDATE players 
+                SET wins = GREATEST(wins - 1, 0)
+                WHERE discord_id = %s
+            ''', (winner_leader,))
+            
+            # Retirer 1 défaite à l'équipe perdante (leader seulement)
+            loser_leader = match_data.get('loser_team_leader', losers[0])
+            c.execute('''
+                UPDATE players 
+                SET losses = GREATEST(losses - 1, 0)
+                WHERE discord_id = %s
+            ''', (loser_leader,))
+            
+            # Si il y avait un dodge, retirer UN SEUL dodge du compteur
+            dodge_player_id = match_data.get('dodge_player_id')
+            if dodge_player_id:
+                c.execute('''
+                    DELETE FROM dodges 
+                    WHERE id = (
+                        SELECT id FROM dodges 
+                        WHERE discord_id = %s 
+                        ORDER BY dodge_date DESC 
+                        LIMIT 1
+                    )
+                ''', (dodge_player_id,))
+            
+            # Supprimer le match de l'historique
+            c.execute('DELETE FROM match_history WHERE id = %s', (last_match['id'],))
+            
+            conn.commit()
+            
+            # Construire le message de retour
+            winner_names = []
+            loser_names = []
+            
+            for player_id in winners:
+                player = get_player(player_id)
+                if player:
+                    winner_names.append(player['name'])
+            
+            for player_id in losers:
+                player = get_player(player_id)
+                if player:
+                    loser_names.append(player['name'])
+            
+            return True, {
+                'winners': winner_names,
+                'losers': loser_names,
+                'winner_changes': winner_changes,
+                'loser_changes': loser_changes,
+                'had_dodge': dodge_player_id is not None
+            }
+            
+    except Exception as e:
+        logger.error(f"Erreur undo_last_match: {e}")
+        return False, f"Erreur interne: {str(e)}"
     finally:
         conn.close()
 
@@ -496,10 +669,6 @@ def get_cooldown_info():
         conn.close()
 
 # ================================
-# BOT EVENTS (sera remplacé dans __main__)
-# ================================
-
-# ================================
 # LANCEMENT DU BOT
 # ================================
 
@@ -518,6 +687,7 @@ if __name__ == '__main__':
     print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
     print(f"🔔 Rôle ping: {PING_ROLE_ID}")
     print(f"🚨 Pénalité dodge: {DODGE_PENALTY_BASE}+ ELO")
+    print("📈 Système: 1 win/loss/dodge par MATCH")
     
     # Charger les commandes après le démarrage du bot
     @bot.event
