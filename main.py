@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Ultra Simplifié - FICHIER PRINCIPAL
-Configuration, base de données et lancement du bot
+Configuration, base de données et lancement du bot avec système de dodge
 """
 
 import discord
@@ -47,6 +47,10 @@ MAX_CONCURRENT_LOBBIES = 3
 LOBBY_COOLDOWN_MINUTES = 10
 PING_ROLE_ID = 1396673817769803827
 
+# Paramètres système anti-dodge
+DODGE_PENALTY_BASE = 15  # Pénalité de base pour un dodge
+DODGE_PENALTY_MULTIPLIER = 5  # Multiplicateur par dodge supplémentaire
+
 # Bot instance
 intents = discord.Intents.default()
 intents.message_content = True
@@ -75,6 +79,14 @@ def calculate_elo_change(player_elo, opponent_avg_elo, won):
     actual = 1.0 if won else 0.0
     change = K * (actual - expected)
     return round(change)
+
+def calculate_dodge_penalty(dodge_count):
+    """Calcule la pénalité ELO selon le nombre de dodges"""
+    if dodge_count <= 1:
+        return DODGE_PENALTY_BASE
+    else:
+        # Pénalité progressive : 15, 20, 25, 30...
+        return DODGE_PENALTY_BASE + ((dodge_count - 1) * DODGE_PENALTY_MULTIPLIER)
 
 # ================================
 # DATABASE POSTGRESQL
@@ -125,6 +137,16 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS lobby_cooldown (
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Table pour les dodges
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS dodges (
+                    id SERIAL PRIMARY KEY,
+                    discord_id TEXT NOT NULL,
+                    dodge_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (discord_id) REFERENCES players(discord_id)
                 )
             ''')
             
@@ -222,6 +244,47 @@ def get_leaderboard():
     except Exception as e:
         logger.error(f"Erreur get_leaderboard: {e}")
         return []
+    finally:
+        conn.close()
+
+def record_dodge(discord_id):
+    """Enregistre un dodge pour un joueur"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                INSERT INTO dodges (discord_id) 
+                VALUES (%s)
+            ''', (str(discord_id),))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur record_dodge: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_player_dodge_count(discord_id):
+    """Récupère le nombre total de dodges d'un joueur"""
+    conn = get_connection()
+    if not conn:
+        return 0
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                SELECT COUNT(*) as count 
+                FROM dodges 
+                WHERE discord_id = %s
+            ''', (str(discord_id),))
+            result = c.fetchone()
+            return result['count'] if result else 0
+    except Exception as e:
+        logger.error(f"Erreur get_player_dodge_count: {e}")
+        return 0
     finally:
         conn.close()
 
@@ -454,6 +517,7 @@ if __name__ == '__main__':
     print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES} simultanés")
     print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
     print(f"🔔 Rôle ping: {PING_ROLE_ID}")
+    print(f"🚨 Pénalité dodge: {DODGE_PENALTY_BASE}+ ELO")
     
     # Charger les commandes après le démarrage du bot
     @bot.event
