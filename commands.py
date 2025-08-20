@@ -14,7 +14,8 @@ from main import (
     get_player, create_player, update_player_elo, get_leaderboard,
     create_lobby, get_lobby, add_player_to_lobby, remove_player_from_lobby,
     get_all_lobbies, create_random_teams, select_random_maps,
-    calculate_elo_change, get_connection
+    calculate_elo_change, get_connection, get_cooldown_info,
+    MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES, PING_ROLE_ID
 )
 
 # ================================
@@ -36,10 +37,10 @@ async def create_lobby_cmd(ctx, room_code: str = None):
             await ctx.send(message, suppress_embeds=True)
             return
     
-    # Créer le lobby
-    lobby_id = create_lobby(room_code.upper())
+    # Créer le lobby avec vérifications
+    lobby_id, creation_msg = create_lobby(room_code.upper())
     if not lobby_id:
-        message = "❌ Erreur: Impossible de créer le lobby"
+        message = f"❌ Erreur: {creation_msg}"
         await ctx.send(message, suppress_embeds=True)
         return
     
@@ -47,12 +48,16 @@ async def create_lobby_cmd(ctx, room_code: str = None):
     success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
     
     if success:
-        message = (f"🎮 LOBBY CREE!\n"
+        # Ping du rôle + message de création
+        role_mention = f"<@&{PING_ROLE_ID}>"
+        message = (f"{role_mention}\n\n"
+                  f"🎮 NOUVEAU LOBBY!\n"
                   f"Lobby #{lobby_id}\n"
                   f"Code: {room_code.upper()}\n"
                   f"Créateur: {ctx.author.display_name}\n"
                   f"Joueurs: 1/6\n"
-                  f"Rejoindre: !join {lobby_id}")
+                  f"Rejoindre: !join {lobby_id}\n\n"
+                  f"📊 Lobbies actifs: {len(get_all_lobbies())}/{MAX_CONCURRENT_LOBBIES}")
     else:
         message = f"❌ Erreur: {msg}"
     
@@ -151,26 +156,33 @@ async def leave_lobby_cmd(ctx):
 async def list_lobbies_cmd(ctx):
     """!lobbies - Liste des lobbies actifs"""
     lobbies = get_all_lobbies()
+    cooldown_info = get_cooldown_info()
+    
+    message = f"🎮 LOBBIES ACTIFS ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES}):\n\n"
     
     if not lobbies:
-        message = "📋 AUCUN LOBBY\nCréez le premier avec !create <code>"
-        await ctx.send(message, suppress_embeds=True)
-        return
+        message += "📋 Aucun lobby actif\n"
+    else:
+        for lobby in lobbies:
+            lobby_id = lobby['id']
+            room_code = lobby['room_code']
+            players_str = lobby['players']
+            players_count = len(players_str.split(',')) if players_str else 0
+            
+            status = "🟢" if players_count < 6 else "🔴"
+            message += f"{status} Lobby #{lobby_id}\n"
+            message += f"Code: {room_code}\n"
+            message += f"Joueurs: {players_count}/6\n\n"
     
-    message = "🎮 LOBBIES ACTIFS:\n\n"
+    # Afficher le cooldown si actif
+    if cooldown_info and cooldown_info.get('active'):
+        minutes = cooldown_info['remaining_minutes']
+        seconds = cooldown_info['remaining_seconds']
+        message += f"⏰ Cooldown: {minutes}m {seconds}s restantes\n"
+    else:
+        message += "✅ Nouveau lobby possible\n"
     
-    for lobby in lobbies:
-        lobby_id = lobby['id']
-        room_code = lobby['room_code']
-        players_str = lobby['players']
-        players_count = len(players_str.split(',')) if players_str else 0
-        
-        status = "🟢" if players_count < 6 else "🔴"
-        message += f"{status} Lobby #{lobby_id}\n"
-        message += f"Code: {room_code}\n"
-        message += f"Joueurs: {players_count}/6\n\n"
-    
-    message += f"{len(lobbies)} lobby(s) actif(s)"
+    message += f"Créer: !create <code>"
     await ctx.send(message, suppress_embeds=True)
 
 async def show_elo_cmd(ctx):
@@ -243,6 +255,29 @@ async def leaderboard_cmd(ctx):
         current_pos = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), None)
         if current_pos:
             message += f"\n\nVotre position: #{current_pos} - {current_player['elo']} ELO"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def lobby_status_cmd(ctx):
+    """!status - Statut des lobbies et cooldown"""
+    lobbies = get_all_lobbies()
+    cooldown_info = get_cooldown_info()
+    
+    message = f"📊 STATUT SYSTÈME\n\n"
+    message += f"🎮 Lobbies: {len(lobbies)}/{MAX_CONCURRENT_LOBBIES}\n"
+    
+    if cooldown_info and cooldown_info.get('active'):
+        minutes = cooldown_info['remaining_minutes']
+        seconds = cooldown_info['remaining_seconds']
+        message += f"⏰ Cooldown: {minutes}m {seconds}s\n"
+    else:
+        message += f"✅ Création possible\n"
+    
+    message += f"⏱️ Cooldown: {LOBBY_COOLDOWN_MINUTES} min\n"
+    
+    # Statistiques des joueurs
+    players = get_leaderboard()
+    message += f"👥 Joueurs inscrits: {len(players)}"
     
     await ctx.send(message, suppress_embeds=True)
 
@@ -344,6 +379,66 @@ async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord
               "• perdant1, perdant2, perdant3")
     await ctx.send(message, suppress_embeds=True)
 
+async def reset_cooldown_cmd(ctx):
+    """!resetcd - Reset le cooldown (admin seulement)"""
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    conn = get_connection()
+    if not conn:
+        message = "❌ Erreur de connexion à la base"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    try:
+        with conn.cursor() as c:
+            # Reset le cooldown en mettant une date dans le passé
+            c.execute('''
+                UPDATE lobby_cooldown 
+                SET last_creation = CURRENT_TIMESTAMP - INTERVAL '%s minutes'
+                WHERE id = 1
+            ''', (LOBBY_COOLDOWN_MINUTES + 1,))
+            conn.commit()
+        
+        message = "✅ Cooldown reset! Création de lobby possible immédiatement."
+        await ctx.send(message, suppress_embeds=True)
+    except Exception as e:
+        message = f"❌ Erreur lors du reset: {str(e)}"
+        await ctx.send(message, suppress_embeds=True)
+    finally:
+        conn.close()
+
+async def clear_lobbies_cmd(ctx):
+    """!clearlobbies - Supprimer tous les lobbies (admin seulement)"""
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    conn = get_connection()
+    if not conn:
+        message = "❌ Erreur de connexion à la base"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT COUNT(*) as count FROM lobbies')
+            count = c.fetchone()['count']
+            
+            c.execute('DELETE FROM lobbies')
+            conn.commit()
+        
+        message = f"🗑️ {count} lobby(s) supprimé(s)"
+        await ctx.send(message, suppress_embeds=True)
+    except Exception as e:
+        message = f"❌ Erreur: {str(e)}"
+        await ctx.send(message, suppress_embeds=True)
+    finally:
+        conn.close()
+
 # ================================
 # SETUP FONCTION
 # ================================
@@ -376,11 +471,23 @@ async def setup_commands(bot):
     async def _leaderboard(ctx):
         await leaderboard_cmd(ctx)
     
+    @bot.command(name='status')
+    async def _status(ctx):
+        await lobby_status_cmd(ctx)
+    
     @bot.command(name='result')
     @commands.has_permissions(administrator=True)
     async def _result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
                      loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
         await old_record_match_result(ctx, winner1, winner2, winner3, loser1, loser2, loser3)
+    
+    @bot.command(name='resetcd')
+    async def _resetcd(ctx):
+        await reset_cooldown_cmd(ctx)
+    
+    @bot.command(name='clearlobbies')
+    async def _clearlobbies(ctx):
+        await clear_lobbies_cmd(ctx)
     
     # Commande slash admin
     @app_commands.command(name="results", description="Enregistrer un résultat de match")
@@ -408,3 +515,6 @@ async def setup_commands(bot):
     bot.tree.add_command(_results)
     
     print("✅ Toutes les commandes chargées depuis commands.py")
+    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES}")
+    print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
+    print(f"🔔 Rôle ping: {PING_ROLE_ID}")
