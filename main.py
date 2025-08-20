@@ -12,6 +12,7 @@ from psycopg2.extras import RealDictCursor
 import os
 import logging
 import random
+from datetime import datetime, timedelta
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +41,11 @@ MAPS = [
 # Configuration
 TOKEN = os.getenv('DISCORD_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
+
+# Paramètres des lobbies
+MAX_CONCURRENT_LOBBIES = 3
+LOBBY_COOLDOWN_MINUTES = 10
+PING_ROLE_ID = 1396673817769803827
 
 # Bot instance
 intents = discord.Intents.default()
@@ -103,7 +109,7 @@ def init_db():
                 )
             ''')
             
-            # Table lobbies
+            # Table lobbies avec limitation
             c.execute('''
                 CREATE TABLE IF NOT EXISTS lobbies (
                     id SERIAL PRIMARY KEY,
@@ -112,6 +118,21 @@ def init_db():
                     max_players INTEGER DEFAULT 6,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            ''')
+            
+            # Table pour gérer le cooldown global
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS lobby_cooldown (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Insérer une ligne pour le cooldown si elle n'existe pas
+            c.execute('''
+                INSERT INTO lobby_cooldown (id, last_creation) 
+                VALUES (1, CURRENT_TIMESTAMP) 
+                ON CONFLICT (id) DO NOTHING
             ''')
             
             conn.commit()
@@ -204,21 +225,68 @@ def get_leaderboard():
     finally:
         conn.close()
 
-def create_lobby(room_code):
-    """Crée un lobby"""
+def check_lobby_limits():
+    """Vérifie les limites de création de lobby"""
     conn = get_connection()
     if not conn:
-        return None
+        return False, "Erreur de connexion"
     
     try:
         with conn.cursor() as c:
+            # Vérifier le nombre de lobbies actifs
+            c.execute('SELECT COUNT(*) as count FROM lobbies')
+            lobby_count = c.fetchone()['count']
+            
+            if lobby_count >= MAX_CONCURRENT_LOBBIES:
+                return False, f"Limite atteinte: {MAX_CONCURRENT_LOBBIES} lobbies maximum en simultané"
+            
+            # Vérifier le cooldown global
+            c.execute('SELECT last_creation FROM lobby_cooldown WHERE id = 1')
+            result = c.fetchone()
+            
+            if result:
+                last_creation = result['last_creation']
+                cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES)
+                now = datetime.now()
+                
+                if now < cooldown_end:
+                    remaining = cooldown_end - now
+                    minutes = int(remaining.total_seconds() // 60)
+                    seconds = int(remaining.total_seconds() % 60)
+                    return False, f"Cooldown actif: attendez {minutes}m {seconds}s"
+            
+            return True, "OK"
+    except Exception as e:
+        logger.error(f"Erreur check_lobby_limits: {e}")
+        return False, "Erreur interne"
+    finally:
+        conn.close()
+
+def create_lobby(room_code):
+    """Crée un lobby avec vérification des limites"""
+    # Vérifier les limites
+    can_create, message = check_lobby_limits()
+    if not can_create:
+        return None, message
+    
+    conn = get_connection()
+    if not conn:
+        return None, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            # Créer le lobby
             c.execute('INSERT INTO lobbies (room_code) VALUES (%s) RETURNING id', (room_code,))
             lobby_id = c.fetchone()['id']
+            
+            # Mettre à jour le cooldown
+            c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP WHERE id = 1')
+            
             conn.commit()
-            return lobby_id
+            return lobby_id, "Créé avec succès"
     except Exception as e:
         logger.error(f"Erreur create_lobby: {e}")
-        return None
+        return None, "Erreur interne"
     finally:
         conn.close()
 
@@ -333,6 +401,37 @@ def get_all_lobbies():
     finally:
         conn.close()
 
+def get_cooldown_info():
+    """Récupère les informations sur le cooldown"""
+    conn = get_connection()
+    if not conn:
+        return None
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT last_creation FROM lobby_cooldown WHERE id = 1')
+            result = c.fetchone()
+            if result:
+                last_creation = result['last_creation']
+                cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES)
+                now = datetime.now()
+                
+                if now < cooldown_end:
+                    remaining = cooldown_end - now
+                    return {
+                        'active': True,
+                        'remaining_minutes': int(remaining.total_seconds() // 60),
+                        'remaining_seconds': int(remaining.total_seconds() % 60)
+                    }
+                else:
+                    return {'active': False}
+            return None
+    except Exception as e:
+        logger.error(f"Erreur get_cooldown_info: {e}")
+        return None
+    finally:
+        conn.close()
+
 # ================================
 # BOT EVENTS (sera remplacé dans __main__)
 # ================================
@@ -352,6 +451,9 @@ if __name__ == '__main__':
     
     print("🚀 Lancement du bot ELO ultra simplifié...")
     print(f"🐘 Base PostgreSQL: {DATABASE_URL[:50]}...")
+    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES} simultanés")
+    print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
+    print(f"🔔 Rôle ping: {PING_ROLE_ID}")
     
     # Charger les commandes après le démarrage du bot
     @bot.event
