@@ -1,592 +1,711 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot ELO Ultra Simplifié - COMMANDES
-Toutes les commandes du bot (prefix et slash) avec système de dodge
+Bot ELO Ultra Simplifié - FICHIER PRINCIPAL
+Configuration, base de données et lancement du bot avec système de dodge corrigé
 """
 
 import discord
 from discord.ext import commands
-from discord import app_commands
-from typing import Optional, Literal
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
+import logging
+import random
+from datetime import datetime, timedelta
 
-# Import des fonctions depuis main.py
-from main import (
-    get_player, create_player, update_player_elo, get_leaderboard,
-    create_lobby, get_lobby, add_player_to_lobby, remove_player_from_lobby,
-    get_all_lobbies, create_random_teams, select_random_maps,
-    calculate_elo_change, get_connection, get_cooldown_info,
-    MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES, PING_ROLE_ID,
-    record_dodge, get_player_dodge_count, calculate_dodge_penalty
-)
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ================================
-# COMMANDES ULTRA SIMPLES - SANS EMBEDS
-# ================================
+# Maps Brawl Stars
+MAPS = [
+    "Mine Hard Rock",
+    "Fort de Gemmes", 
+    "Tunnel de Mine",
+    "Triple Dribble",
+    "Milieu de Scène", 
+    "Ligue Junior",
+    "Étoile Filante",
+    "Mille-Feuille",
+    "Cachette Secrète",
+    "C'est Chaud Patate",
+    "Zone Sécurisée",
+    "Pont au Loin",
+    "C'est Ouvert !",
+    "Cercle de Feu",
+    "Rocher de la Belle",
+    "Ravin du Bras d'Or"
+]
 
-async def create_lobby_cmd(ctx, room_code: str = None):
-    """!create <code_room> - Créer un lobby"""
-    if not room_code:
-        message = "❌ Usage: !create <code_room>"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Vérifier/créer joueur
-    player = get_player(ctx.author.id)
-    if not player:
-        if not create_player(ctx.author.id, ctx.author.display_name):
-            message = "❌ Erreur: Impossible de créer votre profil"
-            await ctx.send(message, suppress_embeds=True)
-            return
-    
-    # Créer le lobby avec vérifications
-    lobby_id, creation_msg = create_lobby(room_code.upper())
-    if not lobby_id:
-        message = f"❌ Erreur: {creation_msg}"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Ajouter le créateur au lobby
-    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
-    
-    if success:
-        # Ping du rôle + message de création
-        role_mention = f"<@&{PING_ROLE_ID}>"
-        message = (f"{role_mention}\n\n"
-                  f"🎮 NOUVEAU LOBBY!\n"
-                  f"Lobby #{lobby_id}\n"
-                  f"Code: {room_code.upper()}\n"
-                  f"Créateur: {ctx.author.display_name}\n"
-                  f"Joueurs: 1/6\n"
-                  f"Rejoindre: !join {lobby_id}\n\n"
-                  f"📊 Lobbies actifs: {len(get_all_lobbies())}/{MAX_CONCURRENT_LOBBIES}")
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
+# Configuration
+TOKEN = os.getenv('DISCORD_TOKEN')
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-async def join_lobby_cmd(ctx, lobby_id: int = None):
-    """!join <id> - Rejoindre un lobby"""
-    if lobby_id is None:
-        message = "❌ Usage: !join <id_lobby>"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Vérifier/créer joueur
-    player = get_player(ctx.author.id)
-    if not player:
-        if not create_player(ctx.author.id, ctx.author.display_name):
-            message = "❌ Erreur: Impossible de créer votre profil"
-            await ctx.send(message, suppress_embeds=True)
-            return
-    
-    # Rejoindre le lobby
-    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
-    
-    if success:
-        # Récupérer info lobby
-        lobby = get_lobby(lobby_id)
-        if lobby:
-            players_list = lobby['players'].split(',') if lobby['players'] else []
-            players_count = len(players_list)
-            
-            if players_count >= 6:
-                # Créer les équipes aléatoires
-                team1_ids, team2_ids = create_random_teams(players_list)
-                
-                # Récupérer les noms des joueurs
-                team1_names = []
-                team2_names = []
-                
-                for player_id in team1_ids:
-                    player = get_player(player_id)
-                    if player:
-                        team1_names.append(player['name'])
-                
-                for player_id in team2_ids:
-                    player = get_player(player_id)
-                    if player:
-                        team2_names.append(player['name'])
-                
-                # Sélectionner 3 maps aléatoires
-                selected_maps = select_random_maps(3)
-                
-                team1_text = '\n'.join([f"• {name}" for name in team1_names])
-                team2_text = '\n'.join([f"• {name}" for name in team2_names])
-                maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
-                
-                message = (f"🚀 MATCH LANCE!\n"
-                          f"Lobby #{lobby_id} complet! Équipes créées!\n\n"
-                          f"🔵 Équipe 1:\n{team1_text}\n\n"
-                          f"🔴 Équipe 2:\n{team2_text}\n\n"
-                          f"🗺️ Maps:\n{maps_text}\n\n"
-                          f"🎮 Code: {lobby['room_code']}")
-                
-                # Supprimer le lobby maintenant qu'il est lancé
-                conn = get_connection()
-                if conn:
-                    try:
-                        with conn.cursor() as c:
-                            c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
-                            conn.commit()
-                    finally:
-                        conn.close()
-            else:
-                message = (f"✅ LOBBY REJOINT!\n"
-                          f"{msg}\n"
-                          f"Lobby: #{lobby_id}\n"
-                          f"Code: {lobby['room_code']}\n"
-                          f"Joueurs: {players_count}/6")
-        else:
-            message = f"✅ Rejoint: {msg}"
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
+# Paramètres des lobbies
+MAX_CONCURRENT_LOBBIES = 3
+LOBBY_COOLDOWN_MINUTES = 10
+PING_ROLE_ID = 1396673817769803827
 
-async def leave_lobby_cmd(ctx):
-    """!leave - Quitter votre lobby"""
-    success, msg = remove_player_from_lobby(ctx.author.id)
-    
-    if success:
-        message = f"👋 Quitté: {msg}"
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
+# Paramètres système anti-dodge
+DODGE_PENALTY_BASE = 15  # Pénalité de base pour un dodge
+DODGE_PENALTY_MULTIPLIER = 5  # Multiplicateur par dodge supplémentaire
 
-async def list_lobbies_cmd(ctx):
-    """!lobbies - Liste des lobbies actifs"""
-    lobbies = get_all_lobbies()
-    cooldown_info = get_cooldown_info()
-    
-    message = f"🎮 LOBBIES ACTIFS ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES}):\n\n"
-    
-    if not lobbies:
-        message += "📋 Aucun lobby actif\n"
-    else:
-        for lobby in lobbies:
-            lobby_id = lobby['id']
-            room_code = lobby['room_code']
-            players_str = lobby['players']
-            players_count = len(players_str.split(',')) if players_str else 0
-            
-            status = "🟢" if players_count < 6 else "🔴"
-            message += f"{status} Lobby #{lobby_id}\n"
-            message += f"Code: {room_code}\n"
-            message += f"Joueurs: {players_count}/6\n\n"
-    
-    # Afficher le cooldown si actif
-    if cooldown_info and cooldown_info.get('active'):
-        minutes = cooldown_info['remaining_minutes']
-        seconds = cooldown_info['remaining_seconds']
-        message += f"⏰ Cooldown: {minutes}m {seconds}s restantes\n"
-    else:
-        message += "✅ Nouveau lobby possible\n"
-    
-    message += f"Créer: !create <code>"
-    await ctx.send(message, suppress_embeds=True)
-
-async def show_elo_cmd(ctx):
-    """!elo - Voir son ELO et rang"""
-    player = get_player(ctx.author.id)
-    
-    if not player:
-        message = ("❌ NON INSCRIT\n"
-                  "Utilisez !create <code> ou !join <id> pour vous inscrire automatiquement")
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    name = player['name']
-    elo = player['elo']
-    wins = player['wins']
-    losses = player['losses']
-    dodge_count = get_player_dodge_count(ctx.author.id)
-    
-    total_games = wins + losses
-    winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
-    
-    # Calculer le rang
-    players = get_leaderboard()
-    rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
-    
-    message = (f"📊 {name}\n"
-              f"ELO: {elo} points\n"
-              f"Rang: #{rank}/{len(players)}\n"
-              f"Victoires: {wins}\n"
-              f"Défaites: {losses}\n"
-              f"Winrate: {winrate}%")
-    
-    if dodge_count > 0:
-        message += f"\n🚨 Dodges: {dodge_count}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def leaderboard_cmd(ctx):
-    """!leaderboard - Classement des joueurs"""
-    players = get_leaderboard()
-    
-    if not players:
-        message = "📊 CLASSEMENT VIDE\nAucun joueur inscrit"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    message = "🏆 CLASSEMENT ELO\n\n"
-    
-    for i, player in enumerate(players[:10], 1):
-        name = player['name']
-        elo = player['elo']
-        wins = player['wins']
-        losses = player['losses']
-        
-        total_games = wins + losses
-        winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
-        
-        if i == 1:
-            emoji = "🥇"
-        elif i == 2:
-            emoji = "🥈"
-        elif i == 3:
-            emoji = "🥉"
-        else:
-            emoji = f"{i}."
-        
-        message += f"{emoji} {name} - {elo} ELO ({winrate}%)\n"
-    
-    message += f"\n{len(players)} joueur(s) total"
-    
-    # Position du joueur actuel
-    current_player = get_player(ctx.author.id)
-    if current_player:
-        current_pos = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), None)
-        if current_pos:
-            message += f"\n\nVotre position: #{current_pos} - {current_player['elo']} ELO"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def lobby_status_cmd(ctx):
-    """!status - Statut des lobbies et cooldown"""
-    lobbies = get_all_lobbies()
-    cooldown_info = get_cooldown_info()
-    
-    message = f"📊 STATUT SYSTÈME\n\n"
-    message += f"🎮 Lobbies: {len(lobbies)}/{MAX_CONCURRENT_LOBBIES}\n"
-    
-    if cooldown_info and cooldown_info.get('active'):
-        minutes = cooldown_info['remaining_minutes']
-        seconds = cooldown_info['remaining_seconds']
-        message += f"⏰ Cooldown: {minutes}m {seconds}s\n"
-    else:
-        message += f"✅ Création possible\n"
-    
-    message += f"⏱️ Cooldown: {LOBBY_COOLDOWN_MINUTES} min\n"
-    
-    # Statistiques des joueurs
-    players = get_leaderboard()
-    message += f"👥 Joueurs inscrits: {len(players)}"
-    
-    await ctx.send(message, suppress_embeds=True)
+# Bot instance
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # ================================
-# COMMANDES ADMIN - SANS EMBEDS
+# FONCTIONS UTILITAIRES
 # ================================
 
-async def record_match_result(
-    interaction: discord.Interaction,
-    gagnant1: discord.Member,
-    gagnant2: discord.Member,
-    gagnant3: discord.Member,
-    perdant1: discord.Member,
-    perdant2: discord.Member,
-    perdant3: discord.Member,
-    dodge_joueur: Optional[discord.Member] = None,
-    score: Optional[Literal["2-0", "2-1"]] = None
-):
-    """Enregistrer le résultat d'un match avec gestion des dodges"""
-    # Répondre immédiatement pour éviter l'expiration
-    await interaction.response.send_message("⏳ Traitement du match en cours...", ephemeral=True)
-    
-    winners = [gagnant1, gagnant2, gagnant3]
-    losers = [perdant1, perdant2, perdant3]
-    
-    # Vérifier qu'il n'y a pas de doublons
-    all_members = winners + losers
-    unique_ids = set(member.id for member in all_members)
-    
-    if len(unique_ids) != 6:
-        await interaction.edit_original_response(content="❌ Erreur: Chaque joueur ne peut apparaître qu'une seule fois")
-        return
-    
-    # Vérifier que le dodge_joueur fait partie des 6 joueurs
-    if dodge_joueur and dodge_joueur not in all_members:
-        await interaction.edit_original_response(content="❌ Erreur: Le joueur qui a dodge doit faire partie des 6 joueurs du match")
-        return
-    
-    # Vérifier que tous sont inscrits
-    for member in all_members:
-        player = get_player(member.id)
-        if not player:
-            create_player(member.id, member.display_name)
-    
-    # Si dodge, enregistrer et calculer les pénalités
-    dodge_penalty = 0
-    if dodge_joueur:
-        # Enregistrer le dodge dans la base
-        record_dodge(dodge_joueur.id)
-        dodge_penalty = calculate_dodge_penalty(get_player_dodge_count(dodge_joueur.id))
-    
-    # Calculer nouveaux ELO
-    winner_elos = []
-    loser_elos = []
-    
-    for member in winners:
-        player = get_player(member.id)
-        if player:
-            winner_elos.append(player['elo'])
-        else:
-            await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer les données des joueurs")
-            return
-    
-    for member in losers:
-        player = get_player(member.id)
-        if player:
-            loser_elos.append(player['elo'])
-        else:
-            await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer les données des joueurs")
-            return
-    
-    winner_avg = sum(winner_elos) / 3
-    loser_avg = sum(loser_elos) / 3
-    
-    # Mettre à jour ELO avec gestion des dodges
-    message = "⚔️ MATCH ENREGISTRE!\n\n"
-    
-    # Afficher le score si fourni
-    if score:
-        message += f"🏆 Score: {score}\n\n"
-    
-    # Afficher info dodge
-    if dodge_joueur:
-        message += f"🚨 DODGE: {dodge_joueur.display_name}\n"
-        dodge_count = get_player_dodge_count(dodge_joueur.id)
-        message += f"Dodges total: {dodge_count} (-{dodge_penalty} ELO supplémentaire)\n\n"
-    
-    message += "🏆 GAGNANTS:\n"
-    for i, member in enumerate(winners):
-        old_elo = winner_elos[i]
-        base_change = calculate_elo_change(old_elo, loser_avg, True)
-        
-        # Réduction si dodge (les gagnants gagnent un peu moins)
-        if dodge_joueur:
-            base_change = int(base_change * 0.8)  # 20% de réduction
-        
-        new_elo = max(0, old_elo + base_change)
-        if update_player_elo(member.id, new_elo, True):
-            message += f"{member.display_name}: {old_elo} → {new_elo} (+{base_change})\n"
-        else:
-            message += f"{member.display_name}: Erreur mise à jour\n"
-    
-    message += "\n💀 PERDANTS:\n"
-    for i, member in enumerate(losers):
-        old_elo = loser_elos[i]
-        base_change = calculate_elo_change(old_elo, winner_avg, False)
-        
-        if dodge_joueur and member.id == dodge_joueur.id:
-            # Le joueur qui a dodge perd plus
-            final_change = base_change - dodge_penalty
-            new_elo = max(0, old_elo + final_change)
-            if update_player_elo(member.id, new_elo, False):
-                message += f"🚨 {member.display_name}: {old_elo} → {new_elo} ({final_change:+}) [DODGE]\n"
-            else:
-                message += f"🚨 {member.display_name}: Erreur mise à jour [DODGE]\n"
-        else:
-            # Ses coéquipiers perdent moins si dodge
-            if dodge_joueur and dodge_joueur in losers:
-                base_change = int(base_change * 0.3)  # Seulement 30% de la perte normale
-            
-            new_elo = max(0, old_elo + base_change)
-            if update_player_elo(member.id, new_elo, False):
-                dodge_indicator = " [Victime]" if dodge_joueur and dodge_joueur in losers else ""
-                message += f"{member.display_name}: {old_elo} → {new_elo} ({base_change:+}){dodge_indicator}\n"
-            else:
-                message += f"{member.display_name}: Erreur mise à jour\n"
-    
-    # Statistiques du match
-    elo_diff = abs(winner_avg - loser_avg)
-    message += f"\n📊 ANALYSE:\n"
-    message += f"ELO moyen gagnants: {round(winner_avg)}\n"
-    message += f"ELO moyen perdants: {round(loser_avg)}\n"
-    message += f"Écart: {round(elo_diff)} points"
-    
-    if dodge_joueur:
-        message += f"\n\n⚠️ SYSTÈME ANTI-DODGE:\n"
-        message += f"• Pénalité dodge: -{dodge_penalty} ELO\n"
-        message += f"• Coéquipiers protégés: -70% perte\n"
-        message += f"• Gagnants: -20% gain"
-    
-    # Envoyer le message final dans le canal (pas en éphémère)
-    await interaction.followup.send(message, suppress_embeds=True)
-    await interaction.edit_original_response(content="✅ Match traité avec succès!")
+def create_random_teams(player_ids):
+    """Crée 2 équipes aléatoires équilibrées"""
+    shuffled = player_ids.copy()
+    random.shuffle(shuffled)
+    team1 = shuffled[:3]
+    team2 = shuffled[3:6]
+    return team1, team2
 
-async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
-                             loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
-    """!result @w1 @w2 @w3 @l1 @l2 @l3 - Enregistrer un match (ancienne version)"""
-    message = ("⚠️ COMMANDE OBSOLETE\n"
-              "Utilisez la nouvelle commande /results avec les arguments nommés :\n"
-              "• gagnant1, gagnant2, gagnant3\n"
-              "• perdant1, perdant2, perdant3\n"
-              "• dodge_joueur (optionnel)\n"
-              "• score (optionnel): 2-0 ou 2-1")
-    await ctx.send(message, suppress_embeds=True)
+def select_random_maps(count=3):
+    """Sélectionne des maps aléatoires"""
+    return random.sample(MAPS, min(count, len(MAPS)))
 
-async def reset_cooldown_cmd(ctx):
-    """!resetcd - Reset le cooldown (admin seulement)"""
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
+def calculate_elo_change(player_elo, opponent_avg_elo, won):
+    """Calcul ELO simplifié"""
+    K = 30
+    expected = 1 / (1 + 10 ** ((opponent_avg_elo - player_elo) / 400))
+    actual = 1.0 if won else 0.0
+    change = K * (actual - expected)
+    return round(change)
+
+def calculate_dodge_penalty(dodge_count):
+    """Calcule la pénalité ELO selon le nombre de dodges"""
+    if dodge_count <= 1:
+        return DODGE_PENALTY_BASE
+    else:
+        # Pénalité progressive : 15, 20, 25, 30...
+        return DODGE_PENALTY_BASE + ((dodge_count - 1) * DODGE_PENALTY_MULTIPLIER)
+
+# ================================
+# DATABASE POSTGRESQL
+# ================================
+
+def get_connection():
+    """Obtient une connexion à la base PostgreSQL"""
+    try:
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    except Exception as e:
+        logger.error(f"Erreur connexion DB: {e}")
+        return None
+
+def init_db():
+    """Initialise la base de données PostgreSQL"""
     conn = get_connection()
     if not conn:
-        message = "❌ Erreur de connexion à la base"
-        await ctx.send(message, suppress_embeds=True)
+        logger.error("Impossible de se connecter à la base de données")
         return
     
     try:
         with conn.cursor() as c:
-            # Reset le cooldown en mettant une date dans le passé
+            # Table joueurs
             c.execute('''
-                UPDATE lobby_cooldown 
-                SET last_creation = CURRENT_TIMESTAMP - INTERVAL '%s minutes'
-                WHERE id = 1
-            ''', (LOBBY_COOLDOWN_MINUTES + 1,))
+                CREATE TABLE IF NOT EXISTS players (
+                    discord_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    elo INTEGER DEFAULT 1000,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Table lobbies avec limitation
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS lobbies (
+                    id SERIAL PRIMARY KEY,
+                    room_code TEXT NOT NULL,
+                    players TEXT DEFAULT '',
+                    max_players INTEGER DEFAULT 6,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Table pour gérer le cooldown global
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS lobby_cooldown (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Table pour les dodges
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS dodges (
+                    id SERIAL PRIMARY KEY,
+                    discord_id TEXT NOT NULL,
+                    dodge_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (discord_id) REFERENCES players(discord_id)
+                )
+            ''')
+            
+            # Table pour l'historique des matchs (pour l'undo)
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS match_history (
+                    id SERIAL PRIMARY KEY,
+                    match_data TEXT NOT NULL,
+                    match_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Insérer une ligne pour le cooldown si elle n'existe pas
+            c.execute('''
+                INSERT INTO lobby_cooldown (id, last_creation) 
+                VALUES (1, CURRENT_TIMESTAMP) 
+                ON CONFLICT (id) DO NOTHING
+            ''')
+            
             conn.commit()
-        
-        message = "✅ Cooldown reset! Création de lobby possible immédiatement."
-        await ctx.send(message, suppress_embeds=True)
+            logger.info("Base de données initialisée avec succès")
     except Exception as e:
-        message = f"❌ Erreur lors du reset: {str(e)}"
-        await ctx.send(message, suppress_embeds=True)
+        logger.error(f"Erreur initialisation DB: {e}")
     finally:
         conn.close()
 
-async def clear_lobbies_cmd(ctx):
-    """!clearlobbies - Supprimer tous les lobbies (admin seulement)"""
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
+def get_player(discord_id):
+    """Récupère un joueur"""
     conn = get_connection()
     if not conn:
-        message = "❌ Erreur de connexion à la base"
-        await ctx.send(message, suppress_embeds=True)
-        return
+        return None
     
     try:
         with conn.cursor() as c:
-            c.execute('SELECT COUNT(*) as count FROM lobbies')
-            count = c.fetchone()['count']
-            
-            c.execute('DELETE FROM lobbies')
-            conn.commit()
-        
-        message = f"🗑️ {count} lobby(s) supprimé(s)"
-        await ctx.send(message, suppress_embeds=True)
+            c.execute('SELECT * FROM players WHERE discord_id = %s', (str(discord_id),))
+            result = c.fetchone()
+            return dict(result) if result else None
     except Exception as e:
-        message = f"❌ Erreur: {str(e)}"
-        await ctx.send(message, suppress_embeds=True)
+        logger.error(f"Erreur get_player: {e}")
+        return None
+    finally:
+        conn.close()
+
+def create_player(discord_id, name):
+    """Crée un nouveau joueur"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                INSERT INTO players (discord_id, name) 
+                VALUES (%s, %s) 
+                ON CONFLICT (discord_id) DO NOTHING
+            ''', (str(discord_id), name))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur create_player: {e}")
+        return False
+    finally:
+        conn.close()
+
+def update_player_elo_only(discord_id, new_elo):
+    """Met à jour SEULEMENT l'ELO d'un joueur (pas les win/loss)"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                UPDATE players 
+                SET elo = %s 
+                WHERE discord_id = %s
+            ''', (new_elo, str(discord_id)))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur update_player_elo_only: {e}")
+        return False
+    finally:
+        conn.close()
+
+def update_player_elo(discord_id, new_elo, won):
+    """Met à jour l'ELO d'un joueur (ANCIENNE VERSION - gardée pour compatibilité)"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            if won:
+                c.execute('''
+                    UPDATE players 
+                    SET elo = %s, wins = wins + 1 
+                    WHERE discord_id = %s
+                ''', (new_elo, str(discord_id)))
+            else:
+                c.execute('''
+                    UPDATE players 
+                    SET elo = %s, losses = losses + 1 
+                    WHERE discord_id = %s
+                ''', (new_elo, str(discord_id)))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur update_player_elo: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_leaderboard():
+    """Récupère le classement"""
+    conn = get_connection()
+    if not conn:
+        return []
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT * FROM players ORDER BY elo DESC LIMIT 20')
+            results = c.fetchall()
+            return [dict(row) for row in results] if results else []
+    except Exception as e:
+        logger.error(f"Erreur get_leaderboard: {e}")
+        return []
+    finally:
+        conn.close()
+
+def record_dodge(discord_id):
+    """Enregistre UN SEUL dodge pour un joueur"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                INSERT INTO dodges (discord_id) 
+                VALUES (%s)
+            ''', (str(discord_id),))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur record_dodge: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_player_dodge_count(discord_id):
+    """Récupère le nombre total de dodges d'un joueur"""
+    conn = get_connection()
+    if not conn:
+        return 0
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                SELECT COUNT(*) as count 
+                FROM dodges 
+                WHERE discord_id = %s
+            ''', (str(discord_id),))
+            result = c.fetchone()
+            return result['count'] if result else 0
+    except Exception as e:
+        logger.error(f"Erreur get_player_dodge_count: {e}")
+        return 0
+    finally:
+        conn.close()
+
+def save_match_history(winners, losers, winner_elo_changes, loser_elo_changes, dodge_player_id=None):
+    """Sauvegarde l'historique d'un match pour permettre l'annulation"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            # Convertir les listes en JSON string
+            import json
+            
+            match_data = {
+                'winners': [str(w.id) for w in winners],
+                'losers': [str(l.id) for l in losers],
+                'winner_elo_changes': winner_elo_changes,
+                'loser_elo_changes': loser_elo_changes,
+                'dodge_player_id': str(dodge_player_id) if dodge_player_id else None,
+                'winner_team_leader': str(winners[0].id),  # Pour les win/loss d'équipe
+                'loser_team_leader': str(losers[0].id)
+            }
+            
+            c.execute('''
+                INSERT INTO match_history (match_data) 
+                VALUES (%s)
+            ''', (json.dumps(match_data),))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur save_match_history: {e}")
+        return False
+    finally:
+        conn.close()
+
+def undo_last_match():
+    """Annule le dernier match enregistré"""
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            # Récupérer le dernier match
+            c.execute('''
+                SELECT * FROM match_history 
+                ORDER BY match_date DESC 
+                LIMIT 1
+            ''')
+            last_match = c.fetchone()
+            
+            if not last_match:
+                return False, "Aucun match à annuler"
+            
+            import json
+            match_data = json.loads(last_match['match_data'])
+            
+            # Annuler les changements d'ELO pour les gagnants (sans retirer de victoires individuelles)
+            winners = match_data['winners']
+            winner_changes = match_data['winner_elo_changes']
+            
+            for i, player_id in enumerate(winners):
+                old_change = winner_changes[i]
+                # Inverser le changement d'ELO seulement
+                c.execute('''
+                    UPDATE players 
+                    SET elo = elo - %s
+                    WHERE discord_id = %s
+                ''', (old_change, player_id))
+            
+            # Annuler les changements d'ELO pour les perdants (sans retirer de défaites individuelles)
+            losers = match_data['losers']
+            loser_changes = match_data['loser_elo_changes']
+            
+            for i, player_id in enumerate(losers):
+                old_change = loser_changes[i]
+                # Inverser le changement d'ELO seulement
+                c.execute('''
+                    UPDATE players 
+                    SET elo = elo - %s
+                    WHERE discord_id = %s
+                ''', (old_change, player_id))
+            
+            # Retirer 1 victoire à l'équipe gagnante (leader seulement)
+            winner_leader = match_data.get('winner_team_leader', winners[0])
+            c.execute('''
+                UPDATE players 
+                SET wins = GREATEST(wins - 1, 0)
+                WHERE discord_id = %s
+            ''', (winner_leader,))
+            
+            # Retirer 1 défaite à l'équipe perdante (leader seulement)
+            loser_leader = match_data.get('loser_team_leader', losers[0])
+            c.execute('''
+                UPDATE players 
+                SET losses = GREATEST(losses - 1, 0)
+                WHERE discord_id = %s
+            ''', (loser_leader,))
+            
+            # Si il y avait un dodge, retirer UN SEUL dodge du compteur
+            dodge_player_id = match_data.get('dodge_player_id')
+            if dodge_player_id:
+                c.execute('''
+                    DELETE FROM dodges 
+                    WHERE id = (
+                        SELECT id FROM dodges 
+                        WHERE discord_id = %s 
+                        ORDER BY dodge_date DESC 
+                        LIMIT 1
+                    )
+                ''', (dodge_player_id,))
+            
+            # Supprimer le match de l'historique
+            c.execute('DELETE FROM match_history WHERE id = %s', (last_match['id'],))
+            
+            conn.commit()
+            
+            # Construire le message de retour
+            winner_names = []
+            loser_names = []
+            
+            for player_id in winners:
+                player = get_player(player_id)
+                if player:
+                    winner_names.append(player['name'])
+            
+            for player_id in losers:
+                player = get_player(player_id)
+                if player:
+                    loser_names.append(player['name'])
+            
+            return True, {
+                'winners': winner_names,
+                'losers': loser_names,
+                'winner_changes': winner_changes,
+                'loser_changes': loser_changes,
+                'had_dodge': dodge_player_id is not None
+            }
+            
+    except Exception as e:
+        logger.error(f"Erreur undo_last_match: {e}")
+        return False, f"Erreur interne: {str(e)}"
+    finally:
+        conn.close()
+
+def check_lobby_limits():
+    """Vérifie les limites de création de lobby"""
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            # Vérifier le nombre de lobbies actifs
+            c.execute('SELECT COUNT(*) as count FROM lobbies')
+            lobby_count = c.fetchone()['count']
+            
+            if lobby_count >= MAX_CONCURRENT_LOBBIES:
+                return False, f"Limite atteinte: {MAX_CONCURRENT_LOBBIES} lobbies maximum en simultané"
+            
+            # Vérifier le cooldown global
+            c.execute('SELECT last_creation FROM lobby_cooldown WHERE id = 1')
+            result = c.fetchone()
+            
+            if result:
+                last_creation = result['last_creation']
+                cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES)
+                now = datetime.now()
+                
+                if now < cooldown_end:
+                    remaining = cooldown_end - now
+                    minutes = int(remaining.total_seconds() // 60)
+                    seconds = int(remaining.total_seconds() % 60)
+                    return False, f"Cooldown actif: attendez {minutes}m {seconds}s"
+            
+            return True, "OK"
+    except Exception as e:
+        logger.error(f"Erreur check_lobby_limits: {e}")
+        return False, "Erreur interne"
+    finally:
+        conn.close()
+
+def create_lobby(room_code):
+    """Crée un lobby avec vérification des limites"""
+    # Vérifier les limites
+    can_create, message = check_lobby_limits()
+    if not can_create:
+        return None, message
+    
+    conn = get_connection()
+    if not conn:
+        return None, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            # Créer le lobby
+            c.execute('INSERT INTO lobbies (room_code) VALUES (%s) RETURNING id', (room_code,))
+            lobby_id = c.fetchone()['id']
+            
+            # Mettre à jour le cooldown
+            c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP WHERE id = 1')
+            
+            conn.commit()
+            return lobby_id, "Créé avec succès"
+    except Exception as e:
+        logger.error(f"Erreur create_lobby: {e}")
+        return None, "Erreur interne"
+    finally:
+        conn.close()
+
+def get_lobby(lobby_id):
+    """Récupère un lobby"""
+    conn = get_connection()
+    if not conn:
+        return None
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT * FROM lobbies WHERE id = %s', (lobby_id,))
+            result = c.fetchone()
+            return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Erreur get_lobby: {e}")
+        return None
+    finally:
+        conn.close()
+
+def add_player_to_lobby(lobby_id, discord_id):
+    """Ajoute un joueur au lobby"""
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            # Récupérer le lobby
+            c.execute('SELECT players FROM lobbies WHERE id = %s', (lobby_id,))
+            result = c.fetchone()
+            if not result:
+                return False, "Lobby inexistant"
+            
+            players = result['players'].split(',') if result['players'] else []
+            
+            # Vérifier si le joueur est déjà dans le lobby
+            if str(discord_id) in players:
+                return False, "Déjà dans ce lobby"
+            
+            # Vérifier si le lobby est plein
+            if len(players) >= 6:
+                return False, "Lobby complet"
+            
+            # Ajouter le joueur
+            players.append(str(discord_id))
+            players_str = ','.join(filter(None, players))
+            
+            c.execute('UPDATE lobbies SET players = %s WHERE id = %s', (players_str, lobby_id))
+            conn.commit()
+            
+            return True, f"Rejoint! ({len(players)}/6 joueurs)"
+    except Exception as e:
+        logger.error(f"Erreur add_player_to_lobby: {e}")
+        return False, "Erreur interne"
+    finally:
+        conn.close()
+
+def remove_player_from_lobby(discord_id):
+    """Retire un joueur de tous les lobbies"""
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            # Trouver le lobby du joueur
+            c.execute('SELECT id, players FROM lobbies')
+            lobbies = c.fetchall()
+            
+            for lobby in lobbies:
+                lobby_id = lobby['id']
+                players_str = lobby['players']
+                players = players_str.split(',') if players_str else []
+                
+                if str(discord_id) in players:
+                    players.remove(str(discord_id))
+                    new_players_str = ','.join(filter(None, players))
+                    
+                    if new_players_str:
+                        # Lobby pas vide, juste mettre à jour
+                        c.execute('UPDATE lobbies SET players = %s WHERE id = %s', 
+                                 (new_players_str, lobby_id))
+                    else:
+                        # Lobby vide, supprimer
+                        c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
+                    
+                    conn.commit()
+                    return True, f"Quitté lobby {lobby_id}"
+            
+            return False, "Vous n'êtes dans aucun lobby"
+    except Exception as e:
+        logger.error(f"Erreur remove_player_from_lobby: {e}")
+        return False, "Erreur interne"
+    finally:
+        conn.close()
+
+def get_all_lobbies():
+    """Récupère tous les lobbies"""
+    conn = get_connection()
+    if not conn:
+        return []
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT * FROM lobbies ORDER BY created_at DESC')
+            results = c.fetchall()
+            return [dict(row) for row in results] if results else []
+    except Exception as e:
+        logger.error(f"Erreur get_all_lobbies: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_cooldown_info():
+    """Récupère les informations sur le cooldown"""
+    conn = get_connection()
+    if not conn:
+        return None
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT last_creation FROM lobby_cooldown WHERE id = 1')
+            result = c.fetchone()
+            if result:
+                last_creation = result['last_creation']
+                cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES)
+                now = datetime.now()
+                
+                if now < cooldown_end:
+                    remaining = cooldown_end - now
+                    return {
+                        'active': True,
+                        'remaining_minutes': int(remaining.total_seconds() // 60),
+                        'remaining_seconds': int(remaining.total_seconds() % 60)
+                    }
+                else:
+                    return {'active': False}
+            return None
+    except Exception as e:
+        logger.error(f"Erreur get_cooldown_info: {e}")
+        return None
     finally:
         conn.close()
 
 # ================================
-# SETUP FONCTION
+# LANCEMENT DU BOT
 # ================================
 
-async def setup_commands(bot):
-    """Configure toutes les commandes du bot"""
+if __name__ == '__main__':
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN manquant!")
+        exit(1)
     
-    # Commandes prefix
-    @bot.command(name='create')
-    async def _create(ctx, room_code: str = None):
-        await create_lobby_cmd(ctx, room_code)
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL manquant!")
+        exit(1)
     
-    @bot.command(name='join')
-    async def _join(ctx, lobby_id: int = None):
-        await join_lobby_cmd(ctx, lobby_id)
-    
-    @bot.command(name='leave')
-    async def _leave(ctx):
-        await leave_lobby_cmd(ctx)
-    
-    @bot.command(name='lobbies')
-    async def _lobbies(ctx):
-        await list_lobbies_cmd(ctx)
-    
-    @bot.command(name='elo')
-    async def _elo(ctx):
-        await show_elo_cmd(ctx)
-    
-    @bot.command(name='leaderboard', aliases=['top'])
-    async def _leaderboard(ctx):
-        await leaderboard_cmd(ctx)
-    
-    @bot.command(name='status')
-    async def _status(ctx):
-        await lobby_status_cmd(ctx)
-    
-    @bot.command(name='result')
-    @commands.has_permissions(administrator=True)
-    async def _result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
-                     loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
-        await old_record_match_result(ctx, winner1, winner2, winner3, loser1, loser2, loser3)
-    
-    @bot.command(name='resetcd')
-    async def _resetcd(ctx):
-        await reset_cooldown_cmd(ctx)
-    
-    @bot.command(name='clearlobbies')
-    async def _clearlobbies(ctx):
-        await clear_lobbies_cmd(ctx)
-    
-    # Commande slash admin avec système de dodge
-    @app_commands.command(name="results", description="Enregistrer un résultat de match (avec gestion des dodges)")
-    @app_commands.describe(
-        gagnant1="Premier joueur gagnant",
-        gagnant2="Deuxième joueur gagnant", 
-        gagnant3="Troisième joueur gagnant",
-        perdant1="Premier joueur perdant",
-        perdant2="Deuxième joueur perdant",
-        perdant3="Troisième joueur perdant",
-        dodge_joueur="Joueur qui a dodge (optionnel)",
-        score="Score final du match (optionnel)"
-    )
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.choices(score=[
-        app_commands.Choice(name="2-0", value="2-0"),
-        app_commands.Choice(name="2-1", value="2-1")
-    ])
-    async def _results(
-        interaction: discord.Interaction,
-        gagnant1: discord.Member,
-        gagnant2: discord.Member,
-        gagnant3: discord.Member,
-        perdant1: discord.Member,
-        perdant2: discord.Member,
-        perdant3: discord.Member,
-        dodge_joueur: Optional[discord.Member] = None,
-        score: Optional[Literal["2-0", "2-1"]] = None
-    ):
-        await record_match_result(
-            interaction, gagnant1, gagnant2, gagnant3, 
-            perdant1, perdant2, perdant3, dodge_joueur, score
-        )
-    
-    # Ajouter la commande slash au bot
-    bot.tree.add_command(_results)
-    
-    print("✅ Toutes les commandes chargées depuis commands.py")
-    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES}")
+    print("🚀 Lancement du bot ELO ultra simplifié...")
+    print(f"🐘 Base PostgreSQL: {DATABASE_URL[:50]}...")
+    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES} simultanés")
     print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
     print(f"🔔 Rôle ping: {PING_ROLE_ID}")
-    print("🚨 Système anti-dodge activé")
+    print(f"🚨 Pénalité dodge: {DODGE_PENALTY_BASE}+ ELO")
+    print("📈 Système: 1 win/loss/dodge par MATCH")
+    
+    # Charger les commandes après le démarrage du bot
+    @bot.event
+    async def on_ready():
+        print(f'🤖 Bot connecté: {bot.user}')
+        print(f'🐘 Connexion PostgreSQL: {"✅" if get_connection() else "❌"}')
+        init_db()
+        
+        # Charger les commandes
+        from commands import setup_commands as setup_bot_commands
+        await setup_bot_commands(bot)
+        
+        # Synchroniser les commandes slash
+        try:
+            synced = await bot.tree.sync()
+            print(f'📡 {len(synced)} commande(s) slash synchronisée(s)')
+        except Exception as e:
+            print(f'❌ Erreur synchronisation: {e}')
+    
+    # Lancer le bot
+    bot.run(TOKEN)
