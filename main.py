@@ -3,22 +3,62 @@
 """
 Bot ELO Ultra Simplifié
 5 commandes seulement: !create, !join, !leave, !lobbies, !leaderboard
+Base de données PostgreSQL pour Koyeb
 """
 
 import discord
 from discord.ext import commands
-import sqlite3
+from discord import app_commands
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
 from datetime import datetime
 import logging
+import random
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Maps Brawl Stars
+MAPS = [
+    "Mine Hard Rock",
+    "Fort de Gemmes", 
+    "Tunnel de Mine",
+    "Triple Dribble",
+    "Milieu de Scène", 
+    "Ligue Junior",
+    "Étoile Filante",
+    "Mille-Feuille",
+    "Cachette Secrète",
+    "C'est Chaud Patate",
+    "Zone Sécurisée",
+    "Pont au Loin",
+    "C'est Ouvert !",
+    "Cercle de Feu",
+    "Rocher de la Belle",
+    "Ravin du Bras d'Or"
+]
+
+def create_random_teams(player_ids):
+    """Crée 2 équipes aléatoires équilibrées"""
+    # Mélanger les joueurs
+    shuffled = player_ids.copy()
+    random.shuffle(shuffled)
+    
+    # Diviser en 2 équipes
+    team1 = shuffled[:3]
+    team2 = shuffled[3:6]
+    
+    return team1, team2
+
+def select_random_maps(count=3):
+    """Sélectionne des maps aléatoires"""
+    return random.sample(MAPS, min(count, len(MAPS)))
+
 # Configuration
 TOKEN = os.getenv('DISCORD_TOKEN')
-DB_PATH = 'simple_elo.db'
+DATABASE_URL = os.getenv('DATABASE_URL')
 
 # Bot instance
 intents = discord.Intents.default()
@@ -26,170 +66,267 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # ================================
-# DATABASE SIMPLE
+# DATABASE POSTGRESQL
 # ================================
 
+def get_connection():
+    """Obtient une connexion à la base PostgreSQL"""
+    try:
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    except Exception as e:
+        logger.error(f"Erreur connexion DB: {e}")
+        return None
+
 def init_db():
-    """Initialise la base de données SQLite simple"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    """Initialise la base de données PostgreSQL"""
+    conn = get_connection()
+    if not conn:
+        logger.error("Impossible de se connecter à la base de données")
+        return
     
-    # Table joueurs
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS players (
-            discord_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            elo INTEGER DEFAULT 1000,
-            wins INTEGER DEFAULT 0,
-            losses INTEGER DEFAULT 0
-        )
-    ''')
-    
-    # Table lobbies
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS lobbies (
-            id INTEGER PRIMARY KEY,
-            room_code TEXT NOT NULL,
-            players TEXT DEFAULT '',
-            max_players INTEGER DEFAULT 6,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as c:
+            # Table joueurs
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS players (
+                    discord_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    elo INTEGER DEFAULT 1000,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Table lobbies
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS lobbies (
+                    id SERIAL PRIMARY KEY,
+                    room_code TEXT NOT NULL,
+                    players TEXT DEFAULT '',
+                    max_players INTEGER DEFAULT 6,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+            logger.info("Base de données initialisée avec succès")
+    except Exception as e:
+        logger.error(f"Erreur initialisation DB: {e}")
+    finally:
+        conn.close()
 
 def get_player(discord_id):
     """Récupère un joueur"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT * FROM players WHERE discord_id = ?', (str(discord_id),))
-    result = c.fetchone()
-    conn.close()
-    return result
+    conn = get_connection()
+    if not conn:
+        return None
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT * FROM players WHERE discord_id = %s', (str(discord_id),))
+            result = c.fetchone()
+            return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Erreur get_player: {e}")
+        return None
+    finally:
+        conn.close()
 
 def create_player(discord_id, name):
     """Crée un nouveau joueur"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO players (discord_id, name) VALUES (?, ?)', 
-              (str(discord_id), name))
-    conn.commit()
-    conn.close()
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                INSERT INTO players (discord_id, name) 
+                VALUES (%s, %s) 
+                ON CONFLICT (discord_id) DO NOTHING
+            ''', (str(discord_id), name))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur create_player: {e}")
+        return False
+    finally:
+        conn.close()
 
 def update_player_elo(discord_id, new_elo, won):
     """Met à jour l'ELO d'un joueur"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    if won:
-        c.execute('UPDATE players SET elo = ?, wins = wins + 1 WHERE discord_id = ?', 
-                 (new_elo, str(discord_id)))
-    else:
-        c.execute('UPDATE players SET elo = ?, losses = losses + 1 WHERE discord_id = ?', 
-                 (new_elo, str(discord_id)))
-    conn.commit()
-    conn.close()
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            if won:
+                c.execute('''
+                    UPDATE players 
+                    SET elo = %s, wins = wins + 1 
+                    WHERE discord_id = %s
+                ''', (new_elo, str(discord_id)))
+            else:
+                c.execute('''
+                    UPDATE players 
+                    SET elo = %s, losses = losses + 1 
+                    WHERE discord_id = %s
+                ''', (new_elo, str(discord_id)))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur update_player_elo: {e}")
+        return False
+    finally:
+        conn.close()
 
 def get_leaderboard():
     """Récupère le classement"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT * FROM players ORDER BY elo DESC LIMIT 20')
-    results = c.fetchall()
-    conn.close()
-    return results
+    conn = get_connection()
+    if not conn:
+        return []
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT * FROM players ORDER BY elo DESC LIMIT 20')
+            results = c.fetchall()
+            return [dict(row) for row in results] if results else []
+    except Exception as e:
+        logger.error(f"Erreur get_leaderboard: {e}")
+        return []
+    finally:
+        conn.close()
 
 def create_lobby(room_code):
     """Crée un lobby"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO lobbies (room_code) VALUES (?)', (room_code,))
-    lobby_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return lobby_id
+    conn = get_connection()
+    if not conn:
+        return None
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('INSERT INTO lobbies (room_code) VALUES (%s) RETURNING id', (room_code,))
+            lobby_id = c.fetchone()['id']
+            conn.commit()
+            return lobby_id
+    except Exception as e:
+        logger.error(f"Erreur create_lobby: {e}")
+        return None
+    finally:
+        conn.close()
 
 def get_lobby(lobby_id):
     """Récupère un lobby"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT * FROM lobbies WHERE id = ?', (lobby_id,))
-    result = c.fetchone()
-    conn.close()
-    return result
+    conn = get_connection()
+    if not conn:
+        return None
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT * FROM lobbies WHERE id = %s', (lobby_id,))
+            result = c.fetchone()
+            return dict(result) if result else None
+    except Exception as e:
+        logger.error(f"Erreur get_lobby: {e}")
+        return None
+    finally:
+        conn.close()
 
 def add_player_to_lobby(lobby_id, discord_id):
     """Ajoute un joueur au lobby"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
     
-    # Récupérer le lobby
-    c.execute('SELECT players FROM lobbies WHERE id = ?', (lobby_id,))
-    result = c.fetchone()
-    if not result:
+    try:
+        with conn.cursor() as c:
+            # Récupérer le lobby
+            c.execute('SELECT players FROM lobbies WHERE id = %s', (lobby_id,))
+            result = c.fetchone()
+            if not result:
+                return False, "Lobby inexistant"
+            
+            players = result['players'].split(',') if result['players'] else []
+            
+            # Vérifier si le joueur est déjà dans le lobby
+            if str(discord_id) in players:
+                return False, "Déjà dans ce lobby"
+            
+            # Vérifier si le lobby est plein
+            if len(players) >= 6:
+                return False, "Lobby complet"
+            
+            # Ajouter le joueur
+            players.append(str(discord_id))
+            players_str = ','.join(filter(None, players))
+            
+            c.execute('UPDATE lobbies SET players = %s WHERE id = %s', (players_str, lobby_id))
+            conn.commit()
+            
+            return True, f"Rejoint! ({len(players)}/6 joueurs)"
+    except Exception as e:
+        logger.error(f"Erreur add_player_to_lobby: {e}")
+        return False, "Erreur interne"
+    finally:
         conn.close()
-        return False, "Lobby inexistant"
-    
-    players = result[0].split(',') if result[0] else []
-    
-    # Vérifier si le joueur est déjà dans le lobby
-    if str(discord_id) in players:
-        conn.close()
-        return False, "Déjà dans ce lobby"
-    
-    # Vérifier si le lobby est plein
-    if len(players) >= 6:
-        conn.close()
-        return False, "Lobby complet"
-    
-    # Ajouter le joueur
-    players.append(str(discord_id))
-    players_str = ','.join(filter(None, players))
-    
-    c.execute('UPDATE lobbies SET players = ? WHERE id = ?', (players_str, lobby_id))
-    conn.commit()
-    conn.close()
-    
-    return True, f"Rejoint! ({len(players)}/6 joueurs)"
 
 def remove_player_from_lobby(discord_id):
     """Retire un joueur de tous les lobbies"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
     
-    # Trouver le lobby du joueur
-    c.execute('SELECT id, players FROM lobbies')
-    lobbies = c.fetchall()
-    
-    for lobby_id, players_str in lobbies:
-        players = players_str.split(',') if players_str else []
-        if str(discord_id) in players:
-            players.remove(str(discord_id))
-            new_players_str = ','.join(filter(None, players))
+    try:
+        with conn.cursor() as c:
+            # Trouver le lobby du joueur
+            c.execute('SELECT id, players FROM lobbies')
+            lobbies = c.fetchall()
             
-            if new_players_str:
-                # Lobby pas vide, juste mettre à jour
-                c.execute('UPDATE lobbies SET players = ? WHERE id = ?', 
-                         (new_players_str, lobby_id))
-            else:
-                # Lobby vide, supprimer
-                c.execute('DELETE FROM lobbies WHERE id = ?', (lobby_id,))
+            for lobby in lobbies:
+                lobby_id = lobby['id']
+                players_str = lobby['players']
+                players = players_str.split(',') if players_str else []
+                
+                if str(discord_id) in players:
+                    players.remove(str(discord_id))
+                    new_players_str = ','.join(filter(None, players))
+                    
+                    if new_players_str:
+                        # Lobby pas vide, juste mettre à jour
+                        c.execute('UPDATE lobbies SET players = %s WHERE id = %s', 
+                                 (new_players_str, lobby_id))
+                    else:
+                        # Lobby vide, supprimer
+                        c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
+                    
+                    conn.commit()
+                    return True, f"Quitté lobby {lobby_id}"
             
-            conn.commit()
-            conn.close()
-            return True, f"Quitté lobby {lobby_id}"
-    
-    conn.close()
-    return False, "Vous n'êtes dans aucun lobby"
+            return False, "Vous n'êtes dans aucun lobby"
+    except Exception as e:
+        logger.error(f"Erreur remove_player_from_lobby: {e}")
+        return False, "Erreur interne"
+    finally:
+        conn.close()
 
 def get_all_lobbies():
     """Récupère tous les lobbies"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT * FROM lobbies')
-    results = c.fetchall()
-    conn.close()
-    return results
+    conn = get_connection()
+    if not conn:
+        return []
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT * FROM lobbies ORDER BY created_at DESC')
+            results = c.fetchall()
+            return [dict(row) for row in results] if results else []
+    except Exception as e:
+        logger.error(f"Erreur get_all_lobbies: {e}")
+        return []
+    finally:
+        conn.close()
 
 def calculate_elo_change(player_elo, opponent_avg_elo, won):
     """Calcul ELO simplifié"""
@@ -206,7 +343,15 @@ def calculate_elo_change(player_elo, opponent_avg_elo, won):
 @bot.event
 async def on_ready():
     print(f'🤖 Bot connecté: {bot.user}')
+    print(f'🐘 Connexion PostgreSQL: {"✅" if get_connection() else "❌"}')
     init_db()
+    
+    # Synchroniser les commandes slash
+    try:
+        synced = await bot.tree.sync()
+        print(f'📡 {len(synced)} commande(s) slash synchronisée(s)')
+    except Exception as e:
+        print(f'❌ Erreur synchronisation: {e}')
 
 # ================================
 # COMMANDES ULTRA SIMPLES
@@ -222,27 +367,28 @@ async def create_lobby_cmd(ctx, room_code: str = None):
     # Vérifier/créer joueur
     player = get_player(ctx.author.id)
     if not player:
-        create_player(ctx.author.id, ctx.author.display_name)
+        if not create_player(ctx.author.id, ctx.author.display_name):
+            await ctx.send("❌ **Erreur:** Impossible de créer votre profil")
+            return
     
     # Créer le lobby
     lobby_id = create_lobby(room_code.upper())
+    if not lobby_id:
+        await ctx.send("❌ **Erreur:** Impossible de créer le lobby")
+        return
     
     # Ajouter le créateur au lobby
     success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
     
     if success:
-        embed = discord.Embed(
-            title="🎮 Lobby créé!",
-            description=f"**Lobby #{lobby_id}**\nCode: `{room_code.upper()}`",
-            color=0x00FF00
-        )
-        embed.add_field(name="Créateur", value=ctx.author.display_name, inline=True)
-        embed.add_field(name="Joueurs", value="1/6", inline=True)
-        embed.add_field(name="Rejoindre", value=f"`!join {lobby_id}`", inline=True)
+        await ctx.send(f"🎮 **Lobby créé!**\n"
+                      f"**Lobby #{lobby_id}**\n"
+                      f"Code: `{room_code.upper()}`\n"
+                      f"Créateur: {ctx.author.display_name}\n"
+                      f"Joueurs: 1/6\n"
+                      f"Rejoindre: `!join {lobby_id}`")
     else:
-        embed = discord.Embed(title="❌ Erreur", description=msg, color=0xFF0000)
-    
-    await ctx.send(embed=embed)
+        await ctx.send(f"❌ **Erreur:** {msg}")
 
 @bot.command(name='join')
 async def join_lobby_cmd(ctx, lobby_id: int = None):
@@ -254,7 +400,9 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
     # Vérifier/créer joueur
     player = get_player(ctx.author.id)
     if not player:
-        create_player(ctx.author.id, ctx.author.display_name)
+        if not create_player(ctx.author.id, ctx.author.display_name):
+            await ctx.send("❌ **Erreur:** Impossible de créer votre profil")
+            return
     
     # Rejoindre le lobby
     success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
@@ -263,27 +411,60 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
         # Récupérer info lobby
         lobby = get_lobby(lobby_id)
         if lobby:
-            players_count = len(lobby[2].split(',')) if lobby[2] else 0
+            players_list = lobby['players'].split(',') if lobby['players'] else []
+            players_count = len(players_list)
             
-            embed = discord.Embed(
-                title="✅ Lobby rejoint!",
-                description=msg,
-                color=0x00FF00
-            )
-            embed.add_field(name="Lobby", value=f"#{lobby_id}", inline=True)
-            embed.add_field(name="Code", value=f"`{lobby[1]}`", inline=True)
-            embed.add_field(name="Joueurs", value=f"{players_count}/6", inline=True)
-            
-            # Si lobby plein, lancer le match
             if players_count >= 6:
-                embed.add_field(name="🚀 MATCH!", value="Lobby complet! Match lancé!", inline=False)
-                embed.color = 0xFFD700
+                # Créer les équipes aléatoires
+                team1_ids, team2_ids = create_random_teams(players_list)
+                
+                # Récupérer les noms des joueurs
+                team1_names = []
+                team2_names = []
+                
+                for player_id in team1_ids:
+                    player = get_player(player_id)
+                    if player:
+                        team1_names.append(player['name'])
+                
+                for player_id in team2_ids:
+                    player = get_player(player_id)
+                    if player:
+                        team2_names.append(player['name'])
+                
+                # Sélectionner 3 maps aléatoires
+                selected_maps = select_random_maps(3)
+                
+                team1_text = '\n'.join([f"• {name}" for name in team1_names])
+                team2_text = '\n'.join([f"• {name}" for name in team2_names])
+                maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
+                
+                await ctx.send(f"🚀 **MATCH LANCÉ!**\n"
+                              f"Lobby #{lobby_id} complet! Équipes créées!\n\n"
+                              f"🔵 **Équipe 1:**\n{team1_text}\n\n"
+                              f"🔴 **Équipe 2:**\n{team2_text}\n\n"
+                              f"🗺️ **Maps:**\n{maps_text}\n\n"
+                              f"🎮 **Code:** `{lobby['room_code']}`")
+                
+                # Supprimer le lobby maintenant qu'il est lancé
+                conn = get_connection()
+                if conn:
+                    try:
+                        with conn.cursor() as c:
+                            c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
+                            conn.commit()
+                    finally:
+                        conn.close()
+            else:
+                await ctx.send(f"✅ **Lobby rejoint!**\n"
+                              f"{msg}\n"
+                              f"Lobby: #{lobby_id}\n"
+                              f"Code: `{lobby['room_code']}`\n"
+                              f"Joueurs: {players_count}/6")
         else:
-            embed = discord.Embed(title="✅ Rejoint", description=msg, color=0x00FF00)
+            await ctx.send(f"✅ **Rejoint:** {msg}")
     else:
-        embed = discord.Embed(title="❌ Erreur", description=msg, color=0xFF0000)
-    
-    await ctx.send(embed=embed)
+        await ctx.send(f"❌ **Erreur:** {msg}")
 
 @bot.command(name='leave')
 async def leave_lobby_cmd(ctx):
@@ -291,11 +472,9 @@ async def leave_lobby_cmd(ctx):
     success, msg = remove_player_from_lobby(ctx.author.id)
     
     if success:
-        embed = discord.Embed(title="👋 Quitté", description=msg, color=0xFFFF00)
+        await ctx.send(f"👋 **Quitté:** {msg}")
     else:
-        embed = discord.Embed(title="❌ Erreur", description=msg, color=0xFF0000)
-    
-    await ctx.send(embed=embed)
+        await ctx.send(f"❌ **Erreur:** {msg}")
 
 @bot.command(name='lobbies')
 async def list_lobbies_cmd(ctx):
@@ -303,29 +482,53 @@ async def list_lobbies_cmd(ctx):
     lobbies = get_all_lobbies()
     
     if not lobbies:
-        embed = discord.Embed(
-            title="📋 Aucun lobby",
-            description="Créez le premier avec `!create <code>`",
-            color=0x808080
-        )
-        await ctx.send(embed=embed)
+        await ctx.send("📋 **Aucun lobby**\nCréez le premier avec `!create <code>`")
         return
     
-    embed = discord.Embed(title="🎮 Lobbies actifs", color=0x5865F2)
+    message = "🎮 **Lobbies actifs:**\n\n"
     
     for lobby in lobbies:
-        lobby_id, room_code, players_str, max_players, created_at = lobby
+        lobby_id = lobby['id']
+        room_code = lobby['room_code']
+        players_str = lobby['players']
         players_count = len(players_str.split(',')) if players_str else 0
         
         status = "🟢" if players_count < 6 else "🔴"
-        embed.add_field(
-            name=f"{status} Lobby #{lobby_id}",
-            value=f"Code: `{room_code}`\nJoueurs: {players_count}/6",
-            inline=True
-        )
+        message += f"{status} **Lobby #{lobby_id}**\n"
+        message += f"Code: `{room_code}`\n"
+        message += f"Joueurs: {players_count}/6\n\n"
     
-    embed.set_footer(text=f"{len(lobbies)} lobby(s) actif(s)")
-    await ctx.send(embed=embed)
+    message += f"{len(lobbies)} lobby(s) actif(s)"
+    await ctx.send(message)
+
+@bot.command(name='elo')
+async def show_elo_cmd(ctx):
+    """!elo - Voir son ELO et rang"""
+    player = get_player(ctx.author.id)
+    
+    if not player:
+        await ctx.send("❌ **Non inscrit**\n"
+                      "Utilisez `!create <code>` ou `!join <id>` pour vous inscrire automatiquement")
+        return
+    
+    name = player['name']
+    elo = player['elo']
+    wins = player['wins']
+    losses = player['losses']
+    
+    total_games = wins + losses
+    winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
+    
+    # Calculer le rang
+    players = get_leaderboard()
+    rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
+    
+    await ctx.send(f"📊 **{name}**\n"
+                  f"**ELO:** {elo} points\n"
+                  f"**Rang:** #{rank}/{len(players)}\n"
+                  f"**Victoires:** {wins}\n"
+                  f"**Défaites:** {losses}\n"
+                  f"**Winrate:** {winrate}%")
 
 @bot.command(name='leaderboard', aliases=['top'])
 async def leaderboard_cmd(ctx):
@@ -333,19 +536,17 @@ async def leaderboard_cmd(ctx):
     players = get_leaderboard()
     
     if not players:
-        embed = discord.Embed(
-            title="📊 Classement vide",
-            description="Aucun joueur inscrit",
-            color=0x808080
-        )
-        await ctx.send(embed=embed)
+        await ctx.send("📊 **Classement vide**\nAucun joueur inscrit")
         return
     
-    embed = discord.Embed(title="🏆 Classement ELO", color=0xFFD700)
+    message = "🏆 **Classement ELO**\n\n"
     
-    leaderboard_text = ""
     for i, player in enumerate(players[:10], 1):
-        discord_id, name, elo, wins, losses = player
+        name = player['name']
+        elo = player['elo']
+        wins = player['wins']
+        losses = player['losses']
+        
         total_games = wins + losses
         winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
         
@@ -358,39 +559,57 @@ async def leaderboard_cmd(ctx):
         else:
             emoji = f"{i}."
         
-        leaderboard_text += f"{emoji} **{name}** - {elo} ELO ({winrate}%)\n"
+        message += f"{emoji} **{name}** - {elo} ELO ({winrate}%)\n"
     
-    embed.description = leaderboard_text
-    embed.set_footer(text=f"{len(players)} joueur(s) total")
+    message += f"\n{len(players)} joueur(s) total"
     
     # Position du joueur actuel
     current_player = get_player(ctx.author.id)
     if current_player:
-        current_pos = next((i for i, p in enumerate(players, 1) if p[0] == str(ctx.author.id)), None)
+        current_pos = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), None)
         if current_pos:
-            embed.add_field(
-                name="Votre position",
-                value=f"#{current_pos} - {current_player[2]} ELO",
-                inline=True
-            )
+            message += f"\n\n**Votre position:** #{current_pos} - {current_player['elo']} ELO"
     
-    await ctx.send(embed=embed)
+    await ctx.send(message)
 
 # ================================
 # COMMANDES ADMIN SIMPLES
 # ================================
 
-@bot.command(name='result')
-@commands.has_permissions(administrator=True)
-async def record_match_result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
-                             loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
-    """!result @w1 @w2 @w3 @l1 @l2 @l3 - Enregistrer un match"""
-    winners = [winner1, winner2, winner3]
-    losers = [loser1, loser2, loser3]
+@app_commands.command(name="results", description="Enregistrer un résultat de match")
+@app_commands.describe(
+    gagnant1="Premier joueur gagnant",
+    gagnant2="Deuxième joueur gagnant", 
+    gagnant3="Troisième joueur gagnant",
+    perdant1="Premier joueur perdant",
+    perdant2="Deuxième joueur perdant",
+    perdant3="Troisième joueur perdant"
+)
+@app_commands.default_permissions(administrator=True)
+async def record_match_result(
+    interaction: discord.Interaction,
+    gagnant1: discord.Member,
+    gagnant2: discord.Member,
+    gagnant3: discord.Member,
+    perdant1: discord.Member,
+    perdant2: discord.Member,
+    perdant3: discord.Member
+):
+    """Enregistrer le résultat d'un match"""
+    winners = [gagnant1, gagnant2, gagnant3]
+    losers = [perdant1, perdant2, perdant3]
+    
+    # Vérifier qu'il n'y a pas de doublons
+    all_members = winners + losers
+    unique_ids = set(member.id for member in all_members)
+    
+    if len(unique_ids) != 6:
+        await interaction.response.send_message("❌ **Erreur:** Chaque joueur ne peut apparaître qu'une seule fois", 
+                                               ephemeral=True)
+        return
     
     # Vérifier que tous sont inscrits
-    all_players = winners + losers
-    for member in all_players:
+    for member in all_members:
         player = get_player(member.id)
         if not player:
             create_player(member.id, member.display_name)
@@ -401,38 +620,69 @@ async def record_match_result(ctx, winner1: discord.Member, winner2: discord.Mem
     
     for member in winners:
         player = get_player(member.id)
-        winner_elos.append(player[2])  # ELO
+        if player:
+            winner_elos.append(player['elo'])
+        else:
+            await interaction.response.send_message("❌ **Erreur:** Impossible de récupérer les données des joueurs", 
+                                                   ephemeral=True)
+            return
     
     for member in losers:
         player = get_player(member.id)
-        loser_elos.append(player[2])  # ELO
+        if player:
+            loser_elos.append(player['elo'])
+        else:
+            await interaction.response.send_message("❌ **Erreur:** Impossible de récupérer les données des joueurs", 
+                                                   ephemeral=True)
+            return
     
     winner_avg = sum(winner_elos) / 3
     loser_avg = sum(loser_elos) / 3
     
     # Mettre à jour ELO
-    embed = discord.Embed(title="⚔️ Match enregistré!", color=0x00FF00)
+    message = "⚔️ **Match enregistré!**\n\n"
     
-    winners_text = ""
+    message += "🏆 **Gagnants:**\n"
     for i, member in enumerate(winners):
         old_elo = winner_elos[i]
         change = calculate_elo_change(old_elo, loser_avg, True)
         new_elo = max(0, old_elo + change)
-        update_player_elo(member.id, new_elo, True)
-        winners_text += f"**{member.display_name}:** {old_elo} → {new_elo} (+{change})\n"
+        if update_player_elo(member.id, new_elo, True):
+            message += f"**{member.display_name}:** {old_elo} → {new_elo} (+{change})\n"
+        else:
+            message += f"**{member.display_name}:** Erreur mise à jour\n"
     
-    losers_text = ""
+    message += "\n💀 **Perdants:**\n"
     for i, member in enumerate(losers):
         old_elo = loser_elos[i]
         change = calculate_elo_change(old_elo, winner_avg, False)
         new_elo = max(0, old_elo + change)
-        update_player_elo(member.id, new_elo, False)
-        losers_text += f"**{member.display_name}:** {old_elo} → {new_elo} ({change:+})\n"
+        if update_player_elo(member.id, new_elo, False):
+            message += f"**{member.display_name}:** {old_elo} → {new_elo} ({change:+})\n"
+        else:
+            message += f"**{member.display_name}:** Erreur mise à jour\n"
     
-    embed.add_field(name="🏆 Gagnants", value=winners_text, inline=True)
-    embed.add_field(name="💀 Perdants", value=losers_text, inline=True)
+    # Statistiques du match
+    elo_diff = abs(winner_avg - loser_avg)
+    message += f"\n📊 **Analyse:**\n"
+    message += f"**ELO moyen gagnants:** {round(winner_avg)}\n"
+    message += f"**ELO moyen perdants:** {round(loser_avg)}\n"
+    message += f"**Écart:** {round(elo_diff)} points"
     
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(message)
+
+# Ajouter la commande au bot
+bot.tree.add_command(record_match_result)
+
+@bot.command(name='result')
+@commands.has_permissions(administrator=True)
+async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
+                             loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
+    """!result @w1 @w2 @w3 @l1 @l2 @l3 - Enregistrer un match (ancienne version)"""
+    await ctx.send("⚠️ **Commande obsolète**\n"
+                  "Utilisez la nouvelle commande `/results` avec les arguments nommés :\n"
+                  "• `gagnant1`, `gagnant2`, `gagnant3`\n"
+                  "• `perdant1`, `perdant2`, `perdant3`")
 
 # ================================
 # LANCEMENT DU BOT
@@ -443,5 +693,10 @@ if __name__ == '__main__':
         print("❌ DISCORD_TOKEN manquant!")
         exit(1)
     
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL manquant!")
+        exit(1)
+    
     print("🚀 Lancement du bot ELO ultra simplifié...")
+    print(f"🐘 Base PostgreSQL: {DATABASE_URL[:50]}...")
     bot.run(TOKEN)
