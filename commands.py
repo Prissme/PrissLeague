@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Bot ELO Ultra Simplifié - COMMANDES
+Toutes les commandes du bot (prefix et slash)
+"""
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+
+# Import des fonctions depuis main.py
+from main import (
+    get_player, create_player, update_player_elo, get_leaderboard,
+    create_lobby, get_lobby, add_player_to_lobby, remove_player_from_lobby,
+    get_all_lobbies, create_random_teams, select_random_maps,
+    calculate_elo_change, get_connection
+)
+
+# ================================
+# COMMANDES ULTRA SIMPLES - SANS EMBEDS
+# ================================
+
+async def create_lobby_cmd(ctx, room_code: str = None):
+    """!create <code_room> - Créer un lobby"""
+    if not room_code:
+        message = "❌ Usage: !create <code_room>"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Vérifier/créer joueur
+    player = get_player(ctx.author.id)
+    if not player:
+        if not create_player(ctx.author.id, ctx.author.display_name):
+            message = "❌ Erreur: Impossible de créer votre profil"
+            await ctx.send(message, suppress_embeds=True)
+            return
+    
+    # Créer le lobby
+    lobby_id = create_lobby(room_code.upper())
+    if not lobby_id:
+        message = "❌ Erreur: Impossible de créer le lobby"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Ajouter le créateur au lobby
+    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
+    
+    if success:
+        message = (f"🎮 LOBBY CREE!\n"
+                  f"Lobby #{lobby_id}\n"
+                  f"Code: {room_code.upper()}\n"
+                  f"Créateur: {ctx.author.display_name}\n"
+                  f"Joueurs: 1/6\n"
+                  f"Rejoindre: !join {lobby_id}")
+    else:
+        message = f"❌ Erreur: {msg}"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def join_lobby_cmd(ctx, lobby_id: int = None):
+    """!join <id> - Rejoindre un lobby"""
+    if lobby_id is None:
+        message = "❌ Usage: !join <id_lobby>"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Vérifier/créer joueur
+    player = get_player(ctx.author.id)
+    if not player:
+        if not create_player(ctx.author.id, ctx.author.display_name):
+            message = "❌ Erreur: Impossible de créer votre profil"
+            await ctx.send(message, suppress_embeds=True)
+            return
+    
+    # Rejoindre le lobby
+    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
+    
+    if success:
+        # Récupérer info lobby
+        lobby = get_lobby(lobby_id)
+        if lobby:
+            players_list = lobby['players'].split(',') if lobby['players'] else []
+            players_count = len(players_list)
+            
+            if players_count >= 6:
+                # Créer les équipes aléatoires
+                team1_ids, team2_ids = create_random_teams(players_list)
+                
+                # Récupérer les noms des joueurs
+                team1_names = []
+                team2_names = []
+                
+                for player_id in team1_ids:
+                    player = get_player(player_id)
+                    if player:
+                        team1_names.append(player['name'])
+                
+                for player_id in team2_ids:
+                    player = get_player(player_id)
+                    if player:
+                        team2_names.append(player['name'])
+                
+                # Sélectionner 3 maps aléatoires
+                selected_maps = select_random_maps(3)
+                
+                team1_text = '\n'.join([f"• {name}" for name in team1_names])
+                team2_text = '\n'.join([f"• {name}" for name in team2_names])
+                maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
+                
+                message = (f"🚀 MATCH LANCE!\n"
+                          f"Lobby #{lobby_id} complet! Équipes créées!\n\n"
+                          f"🔵 Équipe 1:\n{team1_text}\n\n"
+                          f"🔴 Équipe 2:\n{team2_text}\n\n"
+                          f"🗺️ Maps:\n{maps_text}\n\n"
+                          f"🎮 Code: {lobby['room_code']}")
+                
+                # Supprimer le lobby maintenant qu'il est lancé
+                conn = get_connection()
+                if conn:
+                    try:
+                        with conn.cursor() as c:
+                            c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
+                            conn.commit()
+                    finally:
+                        conn.close()
+            else:
+                message = (f"✅ LOBBY REJOINT!\n"
+                          f"{msg}\n"
+                          f"Lobby: #{lobby_id}\n"
+                          f"Code: {lobby['room_code']}\n"
+                          f"Joueurs: {players_count}/6")
+        else:
+            message = f"✅ Rejoint: {msg}"
+    else:
+        message = f"❌ Erreur: {msg}"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def leave_lobby_cmd(ctx):
+    """!leave - Quitter votre lobby"""
+    success, msg = remove_player_from_lobby(ctx.author.id)
+    
+    if success:
+        message = f"👋 Quitté: {msg}"
+    else:
+        message = f"❌ Erreur: {msg}"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def list_lobbies_cmd(ctx):
+    """!lobbies - Liste des lobbies actifs"""
+    lobbies = get_all_lobbies()
+    
+    if not lobbies:
+        message = "📋 AUCUN LOBBY\nCréez le premier avec !create <code>"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    message = "🎮 LOBBIES ACTIFS:\n\n"
+    
+    for lobby in lobbies:
+        lobby_id = lobby['id']
+        room_code = lobby['room_code']
+        players_str = lobby['players']
+        players_count = len(players_str.split(',')) if players_str else 0
+        
+        status = "🟢" if players_count < 6 else "🔴"
+        message += f"{status} Lobby #{lobby_id}\n"
+        message += f"Code: {room_code}\n"
+        message += f"Joueurs: {players_count}/6\n\n"
+    
+    message += f"{len(lobbies)} lobby(s) actif(s)"
+    await ctx.send(message, suppress_embeds=True)
+
+async def show_elo_cmd(ctx):
+    """!elo - Voir son ELO et rang"""
+    player = get_player(ctx.author.id)
+    
+    if not player:
+        message = ("❌ NON INSCRIT\n"
+                  "Utilisez !create <code> ou !join <id> pour vous inscrire automatiquement")
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    name = player['name']
+    elo = player['elo']
+    wins = player['wins']
+    losses = player['losses']
+    
+    total_games = wins + losses
+    winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
+    
+    # Calculer le rang
+    players = get_leaderboard()
+    rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
+    
+    message = (f"📊 {name}\n"
+              f"ELO: {elo} points\n"
+              f"Rang: #{rank}/{len(players)}\n"
+              f"Victoires: {wins}\n"
+              f"Défaites: {losses}\n"
+              f"Winrate: {winrate}%")
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def leaderboard_cmd(ctx):
+    """!leaderboard - Classement des joueurs"""
+    players = get_leaderboard()
+    
+    if not players:
+        message = "📊 CLASSEMENT VIDE\nAucun joueur inscrit"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    message = "🏆 CLASSEMENT ELO\n\n"
+    
+    for i, player in enumerate(players[:10], 1):
+        name = player['name']
+        elo = player['elo']
+        wins = player['wins']
+        losses = player['losses']
+        
+        total_games = wins + losses
+        winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
+        
+        if i == 1:
+            emoji = "🥇"
+        elif i == 2:
+            emoji = "🥈"
+        elif i == 3:
+            emoji = "🥉"
+        else:
+            emoji = f"{i}."
+        
+        message += f"{emoji} {name} - {elo} ELO ({winrate}%)\n"
+    
+    message += f"\n{len(players)} joueur(s) total"
+    
+    # Position du joueur actuel
+    current_player = get_player(ctx.author.id)
+    if current_player:
+        current_pos = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), None)
+        if current_pos:
+            message += f"\n\nVotre position: #{current_pos} - {current_player['elo']} ELO"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+# ================================
+# COMMANDES ADMIN - SANS EMBEDS
+# ================================
+
+async def record_match_result(
+    interaction: discord.Interaction,
+    gagnant1: discord.Member,
+    gagnant2: discord.Member,
+    gagnant3: discord.Member,
+    perdant1: discord.Member,
+    perdant2: discord.Member,
+    perdant3: discord.Member
+):
+    """Enregistrer le résultat d'un match"""
+    winners = [gagnant1, gagnant2, gagnant3]
+    losers = [perdant1, perdant2, perdant3]
+    
+    # Vérifier qu'il n'y a pas de doublons
+    all_members = winners + losers
+    unique_ids = set(member.id for member in all_members)
+    
+    if len(unique_ids) != 6:
+        await interaction.response.send_message("❌ Erreur: Chaque joueur ne peut apparaître qu'une seule fois", 
+                                               ephemeral=True, suppress_embeds=True)
+        return
+    
+    # Vérifier que tous sont inscrits
+    for member in all_members:
+        player = get_player(member.id)
+        if not player:
+            create_player(member.id, member.display_name)
+    
+    # Calculer nouveaux ELO
+    winner_elos = []
+    loser_elos = []
+    
+    for member in winners:
+        player = get_player(member.id)
+        if player:
+            winner_elos.append(player['elo'])
+        else:
+            await interaction.response.send_message("❌ Erreur: Impossible de récupérer les données des joueurs", 
+                                                   ephemeral=True, suppress_embeds=True)
+            return
+    
+    for member in losers:
+        player = get_player(member.id)
+        if player:
+            loser_elos.append(player['elo'])
+        else:
+            await interaction.response.send_message("❌ Erreur: Impossible de récupérer les données des joueurs", 
+                                                   ephemeral=True, suppress_embeds=True)
+            return
+    
+    winner_avg = sum(winner_elos) / 3
+    loser_avg = sum(loser_elos) / 3
+    
+    # Mettre à jour ELO
+    message = "⚔️ MATCH ENREGISTRE!\n\n"
+    
+    message += "🏆 GAGNANTS:\n"
+    for i, member in enumerate(winners):
+        old_elo = winner_elos[i]
+        change = calculate_elo_change(old_elo, loser_avg, True)
+        new_elo = max(0, old_elo + change)
+        if update_player_elo(member.id, new_elo, True):
+            message += f"{member.display_name}: {old_elo} → {new_elo} (+{change})\n"
+        else:
+            message += f"{member.display_name}: Erreur mise à jour\n"
+    
+    message += "\n💀 PERDANTS:\n"
+    for i, member in enumerate(losers):
+        old_elo = loser_elos[i]
+        change = calculate_elo_change(old_elo, winner_avg, False)
+        new_elo = max(0, old_elo + change)
+        if update_player_elo(member.id, new_elo, False):
+            message += f"{member.display_name}: {old_elo} → {new_elo} ({change:+})\n"
+        else:
+            message += f"{member.display_name}: Erreur mise à jour\n"
+    
+    # Statistiques du match
+    elo_diff = abs(winner_avg - loser_avg)
+    message += f"\n📊 ANALYSE:\n"
+    message += f"ELO moyen gagnants: {round(winner_avg)}\n"
+    message += f"ELO moyen perdants: {round(loser_avg)}\n"
+    message += f"Écart: {round(elo_diff)} points"
+    
+    await interaction.response.send_message(message, suppress_embeds=True)
+
+async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
+                             loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
+    """!result @w1 @w2 @w3 @l1 @l2 @l3 - Enregistrer un match (ancienne version)"""
+    message = ("⚠️ COMMANDE OBSOLETE\n"
+              "Utilisez la nouvelle commande /results avec les arguments nommés :\n"
+              "• gagnant1, gagnant2, gagnant3\n"
+              "• perdant1, perdant2, perdant3")
+    await ctx.send(message, suppress_embeds=True)
+
+# ================================
+# SETUP FONCTION
+# ================================
+
+async def setup_commands(bot):
+    """Configure toutes les commandes du bot"""
+    
+    # Commandes prefix
+    @bot.command(name='create')
+    async def _create(ctx, room_code: str = None):
+        await create_lobby_cmd(ctx, room_code)
+    
+    @bot.command(name='join')
+    async def _join(ctx, lobby_id: int = None):
+        await join_lobby_cmd(ctx, lobby_id)
+    
+    @bot.command(name='leave')
+    async def _leave(ctx):
+        await leave_lobby_cmd(ctx)
+    
+    @bot.command(name='lobbies')
+    async def _lobbies(ctx):
+        await list_lobbies_cmd(ctx)
+    
+    @bot.command(name='elo')
+    async def _elo(ctx):
+        await show_elo_cmd(ctx)
+    
+    @bot.command(name='leaderboard', aliases=['top'])
+    async def _leaderboard(ctx):
+        await leaderboard_cmd(ctx)
+    
+    @bot.command(name='result')
+    @commands.has_permissions(administrator=True)
+    async def _result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
+                     loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
+        await old_record_match_result(ctx, winner1, winner2, winner3, loser1, loser2, loser3)
+    
+    # Commande slash admin
+    @app_commands.command(name="results", description="Enregistrer un résultat de match")
+    @app_commands.describe(
+        gagnant1="Premier joueur gagnant",
+        gagnant2="Deuxième joueur gagnant", 
+        gagnant3="Troisième joueur gagnant",
+        perdant1="Premier joueur perdant",
+        perdant2="Deuxième joueur perdant",
+        perdant3="Troisième joueur perdant"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def _results(
+        interaction: discord.Interaction,
+        gagnant1: discord.Member,
+        gagnant2: discord.Member,
+        gagnant3: discord.Member,
+        perdant1: discord.Member,
+        perdant2: discord.Member,
+        perdant3: discord.Member
+    ):
+        await record_match_result(interaction, gagnant1, gagnant2, gagnant3, perdant1, perdant2, perdant3)
+    
+    # Ajouter la commande slash au bot
+    bot.tree.add_command(_results)
+    
+    print("✅ Toutes les commandes chargées depuis commands.py")
