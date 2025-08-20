@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Ultra Simplifié - COMMANDES
-Toutes les commandes du bot (prefix et slash)
+Toutes les commandes du bot (prefix et slash) avec système de dodge
 """
 
 import discord
 from discord.ext import commands
 from discord import app_commands
+from typing import Optional, Literal
 
 # Import des fonctions depuis main.py
 from main import (
@@ -15,7 +16,8 @@ from main import (
     create_lobby, get_lobby, add_player_to_lobby, remove_player_from_lobby,
     get_all_lobbies, create_random_teams, select_random_maps,
     calculate_elo_change, get_connection, get_cooldown_info,
-    MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES, PING_ROLE_ID
+    MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES, PING_ROLE_ID,
+    record_dodge, get_player_dodge_count, calculate_dodge_penalty
 )
 
 # ================================
@@ -199,6 +201,7 @@ async def show_elo_cmd(ctx):
     elo = player['elo']
     wins = player['wins']
     losses = player['losses']
+    dodge_count = get_player_dodge_count(ctx.author.id)
     
     total_games = wins + losses
     winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
@@ -213,6 +216,9 @@ async def show_elo_cmd(ctx):
               f"Victoires: {wins}\n"
               f"Défaites: {losses}\n"
               f"Winrate: {winrate}%")
+    
+    if dodge_count > 0:
+        message += f"\n🚨 Dodges: {dodge_count}"
     
     await ctx.send(message, suppress_embeds=True)
 
@@ -292,9 +298,11 @@ async def record_match_result(
     gagnant3: discord.Member,
     perdant1: discord.Member,
     perdant2: discord.Member,
-    perdant3: discord.Member
+    perdant3: discord.Member,
+    dodge_joueur: Optional[discord.Member] = None,
+    score: Optional[Literal["2-0", "2-1"]] = None
 ):
-    """Enregistrer le résultat d'un match"""
+    """Enregistrer le résultat d'un match avec gestion des dodges"""
     winners = [gagnant1, gagnant2, gagnant3]
     losers = [perdant1, perdant2, perdant3]
     
@@ -307,11 +315,24 @@ async def record_match_result(
                                                ephemeral=True, suppress_embeds=True)
         return
     
+    # Vérifier que le dodge_joueur fait partie des 6 joueurs
+    if dodge_joueur and dodge_joueur not in all_members:
+        await interaction.response.send_message("❌ Erreur: Le joueur qui a dodge doit faire partie des 6 joueurs du match", 
+                                               ephemeral=True, suppress_embeds=True)
+        return
+    
     # Vérifier que tous sont inscrits
     for member in all_members:
         player = get_player(member.id)
         if not player:
             create_player(member.id, member.display_name)
+    
+    # Si dodge, enregistrer et calculer les pénalités
+    dodge_penalty = 0
+    if dodge_joueur:
+        # Enregistrer le dodge dans la base
+        record_dodge(dodge_joueur.id)
+        dodge_penalty = calculate_dodge_penalty(get_player_dodge_count(dodge_joueur.id))
     
     # Calculer nouveaux ELO
     winner_elos = []
@@ -338,28 +359,58 @@ async def record_match_result(
     winner_avg = sum(winner_elos) / 3
     loser_avg = sum(loser_elos) / 3
     
-    # Mettre à jour ELO
+    # Mettre à jour ELO avec gestion des dodges
     message = "⚔️ MATCH ENREGISTRE!\n\n"
+    
+    # Afficher le score si fourni
+    if score:
+        message += f"🏆 Score: {score}\n\n"
+    
+    # Afficher info dodge
+    if dodge_joueur:
+        message += f"🚨 DODGE: {dodge_joueur.display_name}\n"
+        dodge_count = get_player_dodge_count(dodge_joueur.id)
+        message += f"Dodges total: {dodge_count} (-{dodge_penalty} ELO supplémentaire)\n\n"
     
     message += "🏆 GAGNANTS:\n"
     for i, member in enumerate(winners):
         old_elo = winner_elos[i]
-        change = calculate_elo_change(old_elo, loser_avg, True)
-        new_elo = max(0, old_elo + change)
+        base_change = calculate_elo_change(old_elo, loser_avg, True)
+        
+        # Réduction si dodge (les gagnants gagnent un peu moins)
+        if dodge_joueur:
+            base_change = int(base_change * 0.8)  # 20% de réduction
+        
+        new_elo = max(0, old_elo + base_change)
         if update_player_elo(member.id, new_elo, True):
-            message += f"{member.display_name}: {old_elo} → {new_elo} (+{change})\n"
+            message += f"{member.display_name}: {old_elo} → {new_elo} (+{base_change})\n"
         else:
             message += f"{member.display_name}: Erreur mise à jour\n"
     
     message += "\n💀 PERDANTS:\n"
     for i, member in enumerate(losers):
         old_elo = loser_elos[i]
-        change = calculate_elo_change(old_elo, winner_avg, False)
-        new_elo = max(0, old_elo + change)
-        if update_player_elo(member.id, new_elo, False):
-            message += f"{member.display_name}: {old_elo} → {new_elo} ({change:+})\n"
+        base_change = calculate_elo_change(old_elo, winner_avg, False)
+        
+        if dodge_joueur and member.id == dodge_joueur.id:
+            # Le joueur qui a dodge perd plus
+            final_change = base_change - dodge_penalty
+            new_elo = max(0, old_elo + final_change)
+            if update_player_elo(member.id, new_elo, False):
+                message += f"🚨 {member.display_name}: {old_elo} → {new_elo} ({final_change:+}) [DODGE]\n"
+            else:
+                message += f"🚨 {member.display_name}: Erreur mise à jour [DODGE]\n"
         else:
-            message += f"{member.display_name}: Erreur mise à jour\n"
+            # Ses coéquipiers perdent moins si dodge
+            if dodge_joueur and dodge_joueur in losers:
+                base_change = int(base_change * 0.3)  # Seulement 30% de la perte normale
+            
+            new_elo = max(0, old_elo + base_change)
+            if update_player_elo(member.id, new_elo, False):
+                dodge_indicator = " [Victime]" if dodge_joueur and dodge_joueur in losers else ""
+                message += f"{member.display_name}: {old_elo} → {new_elo} ({base_change:+}){dodge_indicator}\n"
+            else:
+                message += f"{member.display_name}: Erreur mise à jour\n"
     
     # Statistiques du match
     elo_diff = abs(winner_avg - loser_avg)
@@ -367,6 +418,12 @@ async def record_match_result(
     message += f"ELO moyen gagnants: {round(winner_avg)}\n"
     message += f"ELO moyen perdants: {round(loser_avg)}\n"
     message += f"Écart: {round(elo_diff)} points"
+    
+    if dodge_joueur:
+        message += f"\n\n⚠️ SYSTÈME ANTI-DODGE:\n"
+        message += f"• Pénalité dodge: -{dodge_penalty} ELO\n"
+        message += f"• Coéquipiers protégés: -70% perte\n"
+        message += f"• Gagnants: -20% gain"
     
     await interaction.response.send_message(message, suppress_embeds=True)
 
@@ -376,7 +433,9 @@ async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord
     message = ("⚠️ COMMANDE OBSOLETE\n"
               "Utilisez la nouvelle commande /results avec les arguments nommés :\n"
               "• gagnant1, gagnant2, gagnant3\n"
-              "• perdant1, perdant2, perdant3")
+              "• perdant1, perdant2, perdant3\n"
+              "• dodge_joueur (optionnel)\n"
+              "• score (optionnel): 2-0 ou 2-1")
     await ctx.send(message, suppress_embeds=True)
 
 async def reset_cooldown_cmd(ctx):
@@ -489,17 +548,23 @@ async def setup_commands(bot):
     async def _clearlobbies(ctx):
         await clear_lobbies_cmd(ctx)
     
-    # Commande slash admin
-    @app_commands.command(name="results", description="Enregistrer un résultat de match")
+    # Commande slash admin avec système de dodge
+    @app_commands.command(name="results", description="Enregistrer un résultat de match (avec gestion des dodges)")
     @app_commands.describe(
         gagnant1="Premier joueur gagnant",
         gagnant2="Deuxième joueur gagnant", 
         gagnant3="Troisième joueur gagnant",
         perdant1="Premier joueur perdant",
         perdant2="Deuxième joueur perdant",
-        perdant3="Troisième joueur perdant"
+        perdant3="Troisième joueur perdant",
+        dodge_joueur="Joueur qui a dodge (optionnel)",
+        score="Score final du match (optionnel)"
     )
     @app_commands.default_permissions(administrator=True)
+    @app_commands.choices(score=[
+        app_commands.Choice(name="2-0", value="2-0"),
+        app_commands.Choice(name="2-1", value="2-1")
+    ])
     async def _results(
         interaction: discord.Interaction,
         gagnant1: discord.Member,
@@ -507,9 +572,14 @@ async def setup_commands(bot):
         gagnant3: discord.Member,
         perdant1: discord.Member,
         perdant2: discord.Member,
-        perdant3: discord.Member
+        perdant3: discord.Member,
+        dodge_joueur: Optional[discord.Member] = None,
+        score: Optional[Literal["2-0", "2-1"]] = None
     ):
-        await record_match_result(interaction, gagnant1, gagnant2, gagnant3, perdant1, perdant2, perdant3)
+        await record_match_result(
+            interaction, gagnant1, gagnant2, gagnant3, 
+            perdant1, perdant2, perdant3, dodge_joueur, score
+        )
     
     # Ajouter la commande slash au bot
     bot.tree.add_command(_results)
@@ -518,3 +588,4 @@ async def setup_commands(bot):
     print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES}")
     print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
     print(f"🔔 Rôle ping: {PING_ROLE_ID}")
+    print("🚨 Système anti-dodge activé")
