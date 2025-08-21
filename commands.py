@@ -500,6 +500,93 @@ async def clear_lobbies_cmd(ctx):
     finally:
         conn.close()
 
+async def reduce_losses_cmd(ctx):
+    """!reducelosses - Retirer 3 défaites et ajouter 30 ELO aux joueurs avec 4+ défaites (admin seulement)"""
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    conn = get_connection()
+    if not conn:
+        message = "❌ Erreur de connexion à la base"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    try:
+        with conn.cursor() as c:
+            # Récupérer les joueurs avec 4 défaites ou plus
+            c.execute('''
+                SELECT discord_id, name, elo, wins, losses 
+                FROM players 
+                WHERE losses >= 4
+                ORDER BY losses DESC
+            ''')
+            players = c.fetchall()
+            
+            if not players:
+                message = "ℹ️ Aucun joueur trouvé avec 4 défaites ou plus"
+                await ctx.send(message, suppress_embeds=True)
+                return
+            
+            # Effectuer les ajustements
+            affected_count = 0
+            adjustments = []
+            
+            for player in players:
+                old_elo = player['elo']
+                old_losses = player['losses']
+                wins = player['wins']
+                
+                new_elo = old_elo + 30
+                new_losses = old_losses - 3
+                
+                # Mettre à jour en base
+                c.execute('''
+                    UPDATE players 
+                    SET elo = %s, losses = %s 
+                    WHERE discord_id = %s
+                ''', (new_elo, new_losses, player['discord_id']))
+                
+                # Calculer le nouveau winrate
+                total_games = wins + new_losses
+                new_winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
+                
+                adjustments.append({
+                    'name': player['name'],
+                    'old_elo': old_elo,
+                    'new_elo': new_elo,
+                    'old_losses': old_losses,
+                    'new_losses': new_losses,
+                    'winrate': new_winrate
+                })
+                affected_count += 1
+            
+            conn.commit()
+            
+            # Construire le message de réponse
+            message = f"✅ AJUSTEMENT TERMINE!\n\n"
+            message += f"📊 {affected_count} joueur(s) ajusté(s):\n\n"
+            
+            for adj in adjustments[:10]:  # Limiter à 10 pour éviter les messages trop longs
+                message += f"{adj['name']}:\n"
+                message += f"  ELO: {adj['old_elo']} → {adj['new_elo']} (+30)\n"
+                message += f"  Défaites: {adj['old_losses']} → {adj['new_losses']} (-3)\n"
+                message += f"  Winrate: {adj['winrate']}%\n\n"
+            
+            if len(adjustments) > 10:
+                message += f"... et {len(adjustments) - 10} autre(s) joueur(s)\n\n"
+            
+            message += f"🔧 Total traité: {affected_count} joueur(s)"
+            
+            await ctx.send(message, suppress_embeds=True)
+            
+    except Exception as e:
+        message = f"❌ Erreur lors de l'ajustement: {str(e)}"
+        await ctx.send(message, suppress_embeds=True)
+    finally:
+        conn.close()
+
 # ================================
 # SETUP FONCTION
 # ================================
@@ -550,6 +637,10 @@ async def setup_commands(bot):
     async def _clearlobbies(ctx):
         await clear_lobbies_cmd(ctx)
     
+    @bot.command(name='reducelosses')
+    async def _reducelosses(ctx):
+        await reduce_losses_cmd(ctx)
+    
     # Commande slash admin avec système de dodge
     @app_commands.command(name="results", description="Enregistrer un résultat de match (avec gestion des dodges)")
     @app_commands.describe(
@@ -591,3 +682,4 @@ async def setup_commands(bot):
     print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
     print(f"🔔 Rôle ping: {PING_ROLE_ID}")
     print("🚨 Système anti-dodge activé")
+    print("🔧 Commande !reducelosses disponible (admin)")
