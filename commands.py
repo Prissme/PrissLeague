@@ -198,288 +198,6 @@ async def create_lobby_cmd(ctx, room_code: str = None):
     if not room_code:
         message = "❌ Usage: !create <code_room>"
         await ctx.send(message, suppress_embeds=True)
-
-async def reset_cooldown_cmd(ctx):
-    """!resetcd - Reset le cooldown (admin seulement)"""
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    conn = get_connection()
-    if not conn:
-        message = "❌ Erreur de connexion à la base"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    try:
-        with conn.cursor() as c:
-            # Reset le cooldown en mettant une date dans le passé
-            c.execute('''
-                UPDATE lobby_cooldown 
-                SET last_creation = CURRENT_TIMESTAMP - INTERVAL '%s minutes'
-                WHERE id = 1
-            ''', (LOBBY_COOLDOWN_MINUTES + 1,))
-            conn.commit()
-        
-        message = "✅ Cooldown reset! Création de lobby possible immédiatement."
-        await ctx.send(message, suppress_embeds=True)
-    except Exception as e:
-        message = f"❌ Erreur lors du reset: {str(e)}"
-        await ctx.send(message, suppress_embeds=True)
-    finally:
-        conn.close()
-
-async def clear_lobbies_cmd(ctx):
-    """!clearlobbies - Supprimer tous les lobbies (admin seulement)"""
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    conn = get_connection()
-    if not conn:
-        message = "❌ Erreur de connexion à la base"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    try:
-        with conn.cursor() as c:
-            c.execute('SELECT COUNT(*) as count FROM lobbies')
-            count = c.fetchone()['count']
-            
-            c.execute('DELETE FROM lobbies')
-            conn.commit()
-        
-        message = f"🗑️ {count} lobby(s) supprimé(s)"
-        await ctx.send(message, suppress_embeds=True)
-    except Exception as e:
-        message = f"❌ Erreur: {str(e)}"
-        await ctx.send(message, suppress_embeds=True)
-    finally:
-        conn.close()
-
-async def reduce_losses_cmd(ctx):
-    """!reducelosses - Retirer 3 défaites et ajouter 30 ELO aux joueurs avec 4+ défaites (admin seulement)"""
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    conn = get_connection()
-    if not conn:
-        message = "❌ Erreur de connexion à la base"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    try:
-        with conn.cursor() as c:
-            # Récupérer les joueurs avec 4 défaites ou plus
-            c.execute('''
-                SELECT discord_id, name, elo, wins, losses 
-                FROM players 
-                WHERE losses >= 4
-                ORDER BY losses DESC
-            ''')
-            players = c.fetchall()
-            
-            if not players:
-                message = "ℹ️ Aucun joueur trouvé avec 4 défaites ou plus"
-                await ctx.send(message, suppress_embeds=True)
-                return
-            
-            # Effectuer les ajustements
-            affected_count = 0
-            adjustments = []
-            
-            for player in players:
-                old_elo = player['elo']
-                old_losses = player['losses']
-                wins = player['wins']
-                
-                new_elo = old_elo + 30
-                new_losses = old_losses - 3
-                
-                # Mettre à jour en base
-                c.execute('''
-                    UPDATE players 
-                    SET elo = %s, losses = %s 
-                    WHERE discord_id = %s
-                ''', (new_elo, new_losses, player['discord_id']))
-                
-                # Calculer le nouveau winrate
-                total_games = wins + new_losses
-                new_winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
-                
-                adjustments.append({
-                    'name': player['name'],
-                    'old_elo': old_elo,
-                    'new_elo': new_elo,
-                    'old_losses': old_losses,
-                    'new_losses': new_losses,
-                    'winrate': new_winrate
-                })
-                affected_count += 1
-            
-            conn.commit()
-            
-            # Construire le message de réponse
-            message = f"✅ AJUSTEMENT TERMINE!\n\n"
-            message += f"📊 {affected_count} joueur(s) ajusté(s):\n\n"
-            
-            for adj in adjustments[:10]:  # Limiter à 10 pour éviter les messages trop longs
-                message += f"{adj['name']}:\n"
-                message += f"  ELO: {adj['old_elo']} → {adj['new_elo']} (+30)\n"
-                message += f"  Défaites: {adj['old_losses']} → {adj['new_losses']} (-3)\n"
-                message += f"  Winrate: {adj['winrate']}%\n\n"
-            
-            if len(adjustments) > 10:
-                message += f"... et {len(adjustments) - 10} autre(s) joueur(s)\n\n"
-            
-            message += f"🔧 Total traité: {affected_count} joueur(s)"
-            
-            await ctx.send(message, suppress_embeds=True)
-            
-    except Exception as e:
-        message = f"❌ Erreur lors de l'ajustement: {str(e)}"
-        await ctx.send(message, suppress_embeds=True)
-    finally:
-        conn.close()
-
-async def undo_match_cmd(ctx):
-    """!undo - Annuler le dernier match (admin seulement)"""
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    success, result = undo_last_match()
-    
-    if success:
-        message = "🔄 MATCH ANNULE!\n\n"
-        message += f"🏆 Anciens gagnants: {', '.join(result['winners'])}\n"
-        message += f"💀 Anciens perdants: {', '.join(result['losers'])}\n\n"
-        message += f"📊 Changements ELO annulés:\n"
-        
-        for i, name in enumerate(result['winners']):
-            change = result['winner_changes'][i]
-            message += f"  {name}: -{change} ELO\n"
-        
-        for i, name in enumerate(result['losers']):
-            change = result['loser_changes'][i]
-            message += f"  {name}: -{change} ELO\n"
-        
-        if result['had_dodge']:
-            message += f"\n🚨 Dodge également annulé"
-        
-        message += "\n✅ Tous les changements ont été inversés"
-    else:
-        message = f"❌ Erreur: {result}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-# ================================
-# SETUP FONCTION
-# ================================
-
-async def setup_commands(bot):
-    """Configure toutes les commandes du bot"""
-    
-    # Commandes prefix
-    @bot.command(name='create')
-    async def _create(ctx, room_code: str = None):
-        await create_lobby_cmd(ctx, room_code)
-    
-    @bot.command(name='join')
-    async def _join(ctx, lobby_id: int = None):
-        await join_lobby_cmd(ctx, lobby_id)
-    
-    @bot.command(name='leave')
-    async def _leave(ctx):
-        await leave_lobby_cmd(ctx)
-    
-    @bot.command(name='lobbies')
-    async def _lobbies(ctx):
-        await list_lobbies_cmd(ctx)
-    
-    @bot.command(name='elo')
-    async def _elo(ctx):
-        await show_elo_cmd(ctx)
-    
-    @bot.command(name='leaderboard', aliases=['top'])
-    async def _leaderboard(ctx):
-        await leaderboard_cmd(ctx)
-    
-    @bot.command(name='status')
-    async def _status(ctx):
-        await lobby_status_cmd(ctx)
-    
-    @bot.command(name='result')
-    @commands.has_permissions(administrator=True)
-    async def _result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
-                     loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
-        await old_record_match_result(ctx, winner1, winner2, winner3, loser1, loser2, loser3)
-    
-    @bot.command(name='resetcd')
-    async def _resetcd(ctx):
-        await reset_cooldown_cmd(ctx)
-    
-    @bot.command(name='clearlobbies')
-    async def _clearlobbies(ctx):
-        await clear_lobbies_cmd(ctx)
-    
-    @bot.command(name='reducelosses')
-    async def _reducelosses(ctx):
-        await reduce_losses_cmd(ctx)
-    
-    @bot.command(name='undo')
-    async def _undo(ctx):
-        await undo_match_cmd(ctx)
-    
-    # Commande slash admin avec système de dodge
-    @app_commands.command(name="results", description="Enregistrer un résultat de match (avec gestion des dodges)")
-    @app_commands.describe(
-        gagnant1="Premier joueur gagnant",
-        gagnant2="Deuxième joueur gagnant", 
-        gagnant3="Troisième joueur gagnant",
-        perdant1="Premier joueur perdant",
-        perdant2="Deuxième joueur perdant",
-        perdant3="Troisième joueur perdant",
-        dodge_joueur="Joueur qui a dodge (optionnel)",
-        score="Score final du match (optionnel)"
-    )
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.choices(score=[
-        app_commands.Choice(name="2-0", value="2-0"),
-        app_commands.Choice(name="2-1", value="2-1")
-    ])
-    async def _results(
-        interaction: discord.Interaction,
-        gagnant1: discord.Member,
-        gagnant2: discord.Member,
-        gagnant3: discord.Member,
-        perdant1: discord.Member,
-        perdant2: discord.Member,
-        perdant3: discord.Member,
-        dodge_joueur: Optional[discord.Member] = None,
-        score: Optional[Literal["2-0", "2-1"]] = None
-    ):
-        await record_match_result(
-            interaction, gagnant1, gagnant2, gagnant3, 
-            perdant1, perdant2, perdant3, dodge_joueur, score
-        )
-    
-    # Ajouter la commande slash au bot
-    bot.tree.add_command(_results)
-    
-    print("✅ Toutes les commandes chargées depuis commands.py")
-    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES}")
-    print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
-    print(f"🔔 Rôle ping: {PING_ROLE_ID}")
-    print(f"📺 Salon validation: {RESULT_CHANNEL_ID}")
-    print("🚨 Système anti-dodge activé")
-    print("🔘 Système de boutons de validation activé")
-    print("🔧 Commandes admin disponibles: !resetcd, !clearlobbies, !reducelosses, !undo")embeds=True)
         return
     
     # Vérifier/créer joueur
@@ -905,4 +623,286 @@ async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord
               "• dodge_joueur (optionnel)\n"
               "• score (optionnel): 2-0 ou 2-1\n\n"
               "OU utilisez les boutons automatiques dans le salon de validation!")
-    await ctx.send(message, suppress_
+    await ctx.send(message, suppress_embeds=True)
+
+async def reset_cooldown_cmd(ctx):
+    """!resetcd - Reset le cooldown (admin seulement)"""
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    conn = get_connection()
+    if not conn:
+        message = "❌ Erreur de connexion à la base"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    try:
+        with conn.cursor() as c:
+            # Reset le cooldown en mettant une date dans le passé
+            c.execute('''
+                UPDATE lobby_cooldown 
+                SET last_creation = CURRENT_TIMESTAMP - INTERVAL '%s minutes'
+                WHERE id = 1
+            ''', (LOBBY_COOLDOWN_MINUTES + 1,))
+            conn.commit()
+        
+        message = "✅ Cooldown reset! Création de lobby possible immédiatement."
+        await ctx.send(message, suppress_embeds=True)
+    except Exception as e:
+        message = f"❌ Erreur lors du reset: {str(e)}"
+        await ctx.send(message, suppress_embeds=True)
+    finally:
+        conn.close()
+
+async def clear_lobbies_cmd(ctx):
+    """!clearlobbies - Supprimer tous les lobbies (admin seulement)"""
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    conn = get_connection()
+    if not conn:
+        message = "❌ Erreur de connexion à la base"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('SELECT COUNT(*) as count FROM lobbies')
+            count = c.fetchone()['count']
+            
+            c.execute('DELETE FROM lobbies')
+            conn.commit()
+        
+        message = f"🗑️ {count} lobby(s) supprimé(s)"
+        await ctx.send(message, suppress_embeds=True)
+    except Exception as e:
+        message = f"❌ Erreur: {str(e)}"
+        await ctx.send(message, suppress_embeds=True)
+    finally:
+        conn.close()
+
+async def reduce_losses_cmd(ctx):
+    """!reducelosses - Retirer 3 défaites et ajouter 30 ELO aux joueurs avec 4+ défaites (admin seulement)"""
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    conn = get_connection()
+    if not conn:
+        message = "❌ Erreur de connexion à la base"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    try:
+        with conn.cursor() as c:
+            # Récupérer les joueurs avec 4 défaites ou plus
+            c.execute('''
+                SELECT discord_id, name, elo, wins, losses 
+                FROM players 
+                WHERE losses >= 4
+                ORDER BY losses DESC
+            ''')
+            players = c.fetchall()
+            
+            if not players:
+                message = "ℹ️ Aucun joueur trouvé avec 4 défaites ou plus"
+                await ctx.send(message, suppress_embeds=True)
+                return
+            
+            # Effectuer les ajustements
+            affected_count = 0
+            adjustments = []
+            
+            for player in players:
+                old_elo = player['elo']
+                old_losses = player['losses']
+                wins = player['wins']
+                
+                new_elo = old_elo + 30
+                new_losses = old_losses - 3
+                
+                # Mettre à jour en base
+                c.execute('''
+                    UPDATE players 
+                    SET elo = %s, losses = %s 
+                    WHERE discord_id = %s
+                ''', (new_elo, new_losses, player['discord_id']))
+                
+                # Calculer le nouveau winrate
+                total_games = wins + new_losses
+                new_winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
+                
+                adjustments.append({
+                    'name': player['name'],
+                    'old_elo': old_elo,
+                    'new_elo': new_elo,
+                    'old_losses': old_losses,
+                    'new_losses': new_losses,
+                    'winrate': new_winrate
+                })
+                affected_count += 1
+            
+            conn.commit()
+            
+            # Construire le message de réponse
+            message = f"✅ AJUSTEMENT TERMINE!\n\n"
+            message += f"📊 {affected_count} joueur(s) ajusté(s):\n\n"
+            
+            for adj in adjustments[:10]:  # Limiter à 10 pour éviter les messages trop longs
+                message += f"{adj['name']}:\n"
+                message += f"  ELO: {adj['old_elo']} → {adj['new_elo']} (+30)\n"
+                message += f"  Défaites: {adj['old_losses']} → {adj['new_losses']} (-3)\n"
+                message += f"  Winrate: {adj['winrate']}%\n\n"
+            
+            if len(adjustments) > 10:
+                message += f"... et {len(adjustments) - 10} autre(s) joueur(s)\n\n"
+            
+            message += f"🔧 Total traité: {affected_count} joueur(s)"
+            
+            await ctx.send(message, suppress_embeds=True)
+            
+    except Exception as e:
+        message = f"❌ Erreur lors de l'ajustement: {str(e)}"
+        await ctx.send(message, suppress_embeds=True)
+    finally:
+        conn.close()
+
+async def undo_match_cmd(ctx):
+    """!undo - Annuler le dernier match (admin seulement)"""
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    success, result = undo_last_match()
+    
+    if success:
+        message = "🔄 MATCH ANNULE!\n\n"
+        message += f"🏆 Anciens gagnants: {', '.join(result['winners'])}\n"
+        message += f"💀 Anciens perdants: {', '.join(result['losers'])}\n\n"
+        message += f"📊 Changements ELO annulés:\n"
+        
+        for i, name in enumerate(result['winners']):
+            change = result['winner_changes'][i]
+            message += f"  {name}: -{change} ELO\n"
+        
+        for i, name in enumerate(result['losers']):
+            change = result['loser_changes'][i]
+            message += f"  {name}: -{change} ELO\n"
+        
+        if result['had_dodge']:
+            message += f"\n🚨 Dodge également annulé"
+        
+        message += "\n✅ Tous les changements ont été inversés"
+    else:
+        message = f"❌ Erreur: {result}"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+# ================================
+# SETUP FONCTION
+# ================================
+
+async def setup_commands(bot):
+    """Configure toutes les commandes du bot"""
+    
+    # Commandes prefix
+    @bot.command(name='create')
+    async def _create(ctx, room_code: str = None):
+        await create_lobby_cmd(ctx, room_code)
+    
+    @bot.command(name='join')
+    async def _join(ctx, lobby_id: int = None):
+        await join_lobby_cmd(ctx, lobby_id)
+    
+    @bot.command(name='leave')
+    async def _leave(ctx):
+        await leave_lobby_cmd(ctx)
+    
+    @bot.command(name='lobbies')
+    async def _lobbies(ctx):
+        await list_lobbies_cmd(ctx)
+    
+    @bot.command(name='elo')
+    async def _elo(ctx):
+        await show_elo_cmd(ctx)
+    
+    @bot.command(name='leaderboard', aliases=['top'])
+    async def _leaderboard(ctx):
+        await leaderboard_cmd(ctx)
+    
+    @bot.command(name='status')
+    async def _status(ctx):
+        await lobby_status_cmd(ctx)
+    
+    @bot.command(name='result')
+    @commands.has_permissions(administrator=True)
+    async def _result(ctx, winner1: discord.Member, winner2: discord.Member, winner3: discord.Member,
+                     loser1: discord.Member, loser2: discord.Member, loser3: discord.Member):
+        await old_record_match_result(ctx, winner1, winner2, winner3, loser1, loser2, loser3)
+    
+    @bot.command(name='resetcd')
+    async def _resetcd(ctx):
+        await reset_cooldown_cmd(ctx)
+    
+    @bot.command(name='clearlobbies')
+    async def _clearlobbies(ctx):
+        await clear_lobbies_cmd(ctx)
+    
+    @bot.command(name='reducelosses')
+    async def _reducelosses(ctx):
+        await reduce_losses_cmd(ctx)
+    
+    @bot.command(name='undo')
+    async def _undo(ctx):
+        await undo_match_cmd(ctx)
+    
+    # Commande slash admin avec système de dodge
+    @app_commands.command(name="results", description="Enregistrer un résultat de match (avec gestion des dodges)")
+    @app_commands.describe(
+        gagnant1="Premier joueur gagnant",
+        gagnant2="Deuxième joueur gagnant", 
+        gagnant3="Troisième joueur gagnant",
+        perdant1="Premier joueur perdant",
+        perdant2="Deuxième joueur perdant",
+        perdant3="Troisième joueur perdant",
+        dodge_joueur="Joueur qui a dodge (optionnel)",
+        score="Score final du match (optionnel)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.choices(score=[
+        app_commands.Choice(name="2-0", value="2-0"),
+        app_commands.Choice(name="2-1", value="2-1")
+    ])
+    async def _results(
+        interaction: discord.Interaction,
+        gagnant1: discord.Member,
+        gagnant2: discord.Member,
+        gagnant3: discord.Member,
+        perdant1: discord.Member,
+        perdant2: discord.Member,
+        perdant3: discord.Member,
+        dodge_joueur: Optional[discord.Member] = None,
+        score: Optional[Literal["2-0", "2-1"]] = None
+    ):
+        await record_match_result(
+            interaction, gagnant1, gagnant2, gagnant3, 
+            perdant1, perdant2, perdant3, dodge_joueur, score
+        )
+    
+    # Ajouter la commande slash au bot
+    bot.tree.add_command(_results)
+    
+    print("✅ Toutes les commandes chargées depuis commands.py")
+    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES}")
+    print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
+    print(f"🔔 Rôle ping: {PING_ROLE_ID}")
+    print(f"📺 Salon validation: {RESULT_CHANNEL_ID}")
+    print("🚨 Système anti-dodge activé")
+    print("🔘 Système de boutons de validation activé")
+    print("🔧 Commandes admin disponibles: !resetcd, !clearlobbies, !reducelosses, !undo")
