@@ -50,138 +50,153 @@ class MatchResultView(discord.ui.View):
     
     async def handle_match_result(self, interaction: discord.Interaction, team1_wins: bool):
         """Traite le résultat du match"""
-        # Vérifier les permissions admin
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ Seuls les administrateurs peuvent valider les résultats!", ephemeral=True)
-            return
-        
-        # Vérifier que le match n'a pas déjà été validé
-        if self.match_validated:
-            await interaction.response.send_message("❌ Ce match a déjà été validé!", ephemeral=True)
-            return
-        
-        await interaction.response.defer()
-        
-        # Déterminer gagnants et perdants
-        if team1_wins:
-            winner_ids = self.team1_ids
-            loser_ids = self.team2_ids
-            winning_team = "Bleue"
-            winning_color = "🔵"
-        else:
-            winner_ids = self.team2_ids
-            loser_ids = self.team1_ids
-            winning_team = "Rouge" 
-            winning_color = "🔴"
-        
-        # Récupérer les joueurs
-        winners = []
-        losers = []
-        winner_elos = []
-        loser_elos = []
-        
-        for player_id in winner_ids:
-            player = get_player(player_id)
-            if player:
-                winners.append(player)
-                winner_elos.append(player['elo'])
-        
-        for player_id in loser_ids:
-            player = get_player(player_id)
-            if player:
-                losers.append(player)
-                loser_elos.append(player['elo'])
-        
-        if len(winners) != 3 or len(losers) != 3:
-            await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer tous les joueurs")
-            return
-        
-        # Calculer les changements d'ELO
-        winner_avg = sum(winner_elos) / 3
-        loser_avg = sum(loser_elos) / 3
-        
-        winner_elo_changes = []
-        loser_elo_changes = []
-        
-        # Appliquer les changements
-        for i, player in enumerate(winners):
-            old_elo = winner_elos[i]
-            elo_change = calculate_elo_change(old_elo, loser_avg, True)
-            new_elo = max(0, old_elo + elo_change)
-            
-            if update_player_elo(player['discord_id'], new_elo, True):
-                winner_elo_changes.append(elo_change)
-            else:
-                await interaction.edit_original_response(content="❌ Erreur lors de la mise à jour des ELO")
-                return
-        
-        for i, player in enumerate(losers):
-            old_elo = loser_elos[i]
-            elo_change = calculate_elo_change(old_elo, winner_avg, False)
-            new_elo = max(0, old_elo + elo_change)
-            
-            if update_player_elo(player['discord_id'], new_elo, False):
-                loser_elo_changes.append(elo_change)
-            else:
-                await interaction.edit_original_response(content="❌ Erreur lors de la mise à jour des ELO")
-                return
-        
-        # Marquer comme validé
-        self.match_validated = True
-        
-        # Désactiver tous les boutons
-        for item in self.children:
-            item.disabled = True
-        
-        # Construire le message de résultat
-        result_message = f"✅ MATCH VALIDÉ PAR {interaction.user.display_name}\n\n"
-        result_message += f"🏆 VICTOIRE ÉQUIPE {winning_team} {winning_color}\n"
-        result_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
-        
-        result_message += f"{winning_color} GAGNANTS:\n"
-        for i, player in enumerate(winners):
-            old_elo = winner_elos[i]
-            change = winner_elo_changes[i]
-            new_elo = old_elo + change
-            result_message += f"{player['name']}: {old_elo} → {new_elo} (+{change})\n"
-        
-        losing_color = "🔴" if team1_wins else "🔵"
-        result_message += f"\n{losing_color} PERDANTS:\n"
-        for i, player in enumerate(losers):
-            old_elo = loser_elos[i]
-            change = loser_elo_changes[i]
-            new_elo = old_elo + change
-            result_message += f"{player['name']}: {old_elo} → {new_elo} ({change:+})\n"
-        
-        # Statistiques
-        elo_diff = abs(winner_avg - loser_avg)
-        result_message += f"\n📊 ANALYSE:\n"
-        result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
-        result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
-        result_message += f"Écart: {round(elo_diff)} points"
-        
-        # Mettre à jour le message avec les boutons désactivés
         try:
-            await interaction.edit_original_response(content=f"✅ **MATCH VALIDÉ**\n\nÉquipe {winning_team} {winning_color} a gagné!", view=self)
-        except:
-            pass  # Le message peut avoir été supprimé
-        
-        # Envoyer le résultat dans le salon principal
-        channel = interaction.guild.get_channel(RESULT_CHANNEL_ID)
-        if channel:
-            await channel.send(result_message, suppress_embeds=True)
-        
-        # Sauvegarder pour l'historique (undo)
-        # Créer des objets mock pour la compatibilité
-        class MockMember:
-            def __init__(self, discord_id, name):
-                self.id = int(discord_id)
-                self.display_name = name
-        
-        mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
-        mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
-        
-        save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes)
+            # Vérifier les permissions admin
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("❌ Seuls les administrateurs peuvent valider les résultats!", ephemeral=True)
+                return
+            
+            # Vérifier que le match n'a pas déjà été validé
+            if self.match_validated:
+                await interaction.response.send_message("❌ Ce match a déjà été validé!", ephemeral=True)
+                return
+            
+            # Répondre immédiatement pour éviter le timeout
+            await interaction.response.send_message("⏳ Validation en cours...", ephemeral=True)
+            
+            # Marquer comme validé dès le début
+            self.match_validated = True
+            
+            # Déterminer gagnants et perdants
+            if team1_wins:
+                winner_ids = self.team1_ids
+                loser_ids = self.team2_ids
+                winning_team = "Bleue"
+                winning_color = "🔵"
+            else:
+                winner_ids = self.team2_ids
+                loser_ids = self.team1_ids
+                winning_team = "Rouge" 
+                winning_color = "🔴"
+            
+            # Récupérer les joueurs
+            winners = []
+            losers = []
+            winner_elos = []
+            loser_elos = []
+            
+            for player_id in winner_ids:
+                player = get_player(player_id)
+                if player:
+                    winners.append(player)
+                    winner_elos.append(player['elo'])
+            
+            for player_id in loser_ids:
+                player = get_player(player_id)
+                if player:
+                    losers.append(player)
+                    loser_elos.append(player['elo'])
+            
+            if len(winners) != 3 or len(losers) != 3:
+                await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer tous les joueurs")
+                return
+            
+            # Calculer les changements d'ELO
+            winner_avg = sum(winner_elos) / 3
+            loser_avg = sum(loser_elos) / 3
+            
+            winner_elo_changes = []
+            loser_elo_changes = []
+            
+            # Appliquer les changements
+            for i, player in enumerate(winners):
+                old_elo = winner_elos[i]
+                elo_change = calculate_elo_change(old_elo, loser_avg, True)
+                new_elo = max(0, old_elo + elo_change)
+                
+                if update_player_elo(player['discord_id'], new_elo, True):
+                    winner_elo_changes.append(elo_change)
+                else:
+                    await interaction.edit_original_response(content="❌ Erreur lors de la mise à jour des ELO")
+                    return
+            
+            for i, player in enumerate(losers):
+                old_elo = loser_elos[i]
+                elo_change = calculate_elo_change(old_elo, winner_avg, False)
+                new_elo = max(0, old_elo + elo_change)
+                
+                if update_player_elo(player['discord_id'], new_elo, False):
+                    loser_elo_changes.append(elo_change)
+                else:
+                    await interaction.edit_original_response(content="❌ Erreur lors de la mise à jour des ELO")
+                    return
+            
+            # Désactiver tous les boutons
+            for item in self.children:
+                item.disabled = True
+            
+            # Construire le message de résultat
+            result_message = f"✅ MATCH VALIDÉ PAR {interaction.user.display_name}\n\n"
+            result_message += f"🏆 VICTOIRE ÉQUIPE {winning_team} {winning_color}\n"
+            result_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
+            
+            result_message += f"{winning_color} GAGNANTS:\n"
+            for i, player in enumerate(winners):
+                old_elo = winner_elos[i]
+                change = winner_elo_changes[i]
+                new_elo = old_elo + change
+                result_message += f"{player['name']}: {old_elo} → {new_elo} (+{change})\n"
+            
+            losing_color = "🔴" if team1_wins else "🔵"
+            result_message += f"\n{losing_color} PERDANTS:\n"
+            for i, player in enumerate(losers):
+                old_elo = loser_elos[i]
+                change = loser_elo_changes[i]
+                new_elo = old_elo + change
+                result_message += f"{player['name']}: {old_elo} → {new_elo} ({change:+})\n"
+            
+            # Statistiques
+            elo_diff = abs(winner_avg - loser_avg)
+            result_message += f"\n📊 ANALYSE:\n"
+            result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
+            result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
+            result_message += f"Écart: {round(elo_diff)} points"
+            
+            # Sauvegarder pour l'historique (undo)
+            # Créer des objets mock pour la compatibilité
+            class MockMember:
+                def __init__(self, discord_id, name):
+                    self.id = int(discord_id)
+                    self.display_name = name
+            
+            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
+            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
+            
+            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes)
+            
+            # Mettre à jour le message avec les boutons désactivés
+            await interaction.edit_original_response(content=f"✅ **MATCH VALIDÉ**\n\nÉquipe {winning_team} {winning_color} a gagné!")
+            
+            # Mettre à jour le message original avec les boutons désactivés
+            original_message = interaction.message
+            if original_message:
+                try:
+                    new_content = f"✅ **MATCH VALIDÉ** - Équipe {winning_team} {winning_color} a gagné!\n\n" + original_message.content.split('\n\n', 1)[1]
+                    await original_message.edit(content=new_content, view=self)
+                except:
+                    pass
+            
+            # Envoyer le résultat dans le salon principal
+            channel = interaction.guild.get_channel(RESULT_CHANNEL_ID)
+            if channel:
+                await channel.send(result_message, suppress_embeds=True)
+            
+        except Exception as e:
+            print(f"Erreur dans handle_match_result: {e}")
+            try:
+                await interaction.edit_original_response(content=f"❌ Erreur lors de la validation: {str(e)}")
+            except:
+                await interaction.followup.send(f"❌ Erreur lors de la validation: {str(e)}", ephemeral=True)
     
     async def on_timeout(self):
         """Appelé quand la vue expire"""
