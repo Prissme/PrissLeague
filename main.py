@@ -691,14 +691,66 @@ def get_cooldown_info():
         conn.close()
 
 # ================================
+# BOT EVENTS
+# ================================
+
+@bot.event
+async def on_ready():
+    """Quand le bot se connecte"""
+    print(f'🤖 {bot.user} est connecté!')
+    print(f'📊 Serveurs: {len(bot.guilds)}')
+    
+    # Initialiser la base de données
+    init_db()
+    
+    # Synchroniser les commandes slash
+    try:
+        synced = await bot.tree.sync()
+        print(f'⚡ {len(synced)} commande(s) slash synchronisée(s)')
+    except Exception as e:
+        print(f'❌ Erreur sync commandes slash: {e}')
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Gestion globale des erreurs"""
+    if isinstance(error, commands.CommandNotFound):
+        return  # Ignore les commandes inconnues
+    
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Permissions insuffisantes", suppress_embeds=True)
+        return
+    
+    print(f'❌ Erreur commande: {error}')
+    await ctx.send("❌ Erreur interne du bot", suppress_embeds=True)
+
+# ================================
 # LANCEMENT DU BOT
 # ================================
 
-if __name__ == '__main__':
+async def main():
+    """Fonction principale pour lancer le bot"""
     if not TOKEN:
         print("❌ DISCORD_TOKEN manquant!")
-        exit(1)
+        return
     
     if not DATABASE_URL:
         print("❌ DATABASE_URL manquant!")
-        exit(1)
+        return
+    
+    # Importer et configurer les commandes
+    try:
+        from commands import setup_commands
+        await setup_commands(bot)
+    except ImportError as e:
+        print(f"❌ Erreur import commands.py: {e}")
+        return
+    
+    # Lancer le bot
+    try:
+        await bot.start(TOKEN)
+    except Exception as e:
+        print(f"❌ Erreur lancement bot: {e}")
+
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(main())
