@@ -438,7 +438,13 @@ async def leaderboard_cmd(ctx):
     message = "🏆 CLASSEMENT ELO\n\n"
     
     for i, player in enumerate(players[:10], 1):
-        name = player['name']
+        # Récupérer le membre Discord actuel pour avoir le pseudo à jour
+        try:
+            member = ctx.guild.get_member(int(player['discord_id']))
+            display_name = member.display_name if member else player['name']
+        except:
+            display_name = player['name']
+        
         elo = player['elo']
         wins = player['wins']
         losses = player['losses']
@@ -455,7 +461,7 @@ async def leaderboard_cmd(ctx):
         else:
             emoji = f"{i}."
         
-        message += f"{emoji} {name} - {elo} ELO ({winrate}%)\n"
+        message += f"{emoji} {display_name} - {elo} ELO ({winrate}%)\n"
     
     message += f"\n{len(players)} joueur(s) total"
     
