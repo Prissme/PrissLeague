@@ -299,12 +299,15 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
                 team2_text = '\n'.join([f"• {name}" for name in team2_names])
                 maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
                 
+                # Créer le lien cliquable
+                room_link = f"https://link.nulls.gg/nb/invite/gameroom/fr?tag={lobby['room_code']}"
+                
                 message = (f"🚀 MATCH LANCE!\n"
                           f"Lobby #{lobby_id} complet! Équipes créées!\n\n"
                           f"🔵 Équipe 1:\n{team1_text}\n\n"
                           f"🔴 Équipe 2:\n{team2_text}\n\n"
                           f"🗺️ Maps:\n{maps_text}\n\n"
-                          f"🎮 Code: {lobby['room_code']}")
+                          f"🎮 Rejoindre la room: {room_link}")
                 
                 # Envoyer le message principal
                 await ctx.send(message, suppress_embeds=True)
@@ -317,6 +320,7 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
                                         f"🔵 **Équipe Bleue:**\n{team1_text}\n\n"
                                         f"🔴 **Équipe Rouge:**\n{team2_text}\n\n"
                                         f"🗺️ **Maps:**\n{maps_text}\n\n"
+                                        f"🎮 **Lien room:** {room_link}\n\n"
                                         f"⚡ Cliquez sur le bouton de l'équipe gagnante pour valider le résultat!")
                     
                     view = MatchResultView(team1_ids, team2_ids, lobby_id, lobby['room_code'])
@@ -921,3 +925,4 @@ async def setup_commands(bot):
     print("🚨 Système anti-dodge activé")
     print("🔘 Système de boutons de validation activé")
     print("🔧 Commandes admin disponibles: !resetcd, !clearlobbies, !reducelosses, !undo")
+    print("🔗 Liens cliquables nulls.gg activés")
