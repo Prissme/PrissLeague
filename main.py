@@ -54,6 +54,7 @@ DODGE_PENALTY_MULTIPLIER = 5  # Multiplicateur par dodge supplémentaire
 # Bot instance
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # Nécessaire pour get_member
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # ================================
@@ -173,6 +174,27 @@ def init_db():
     finally:
         conn.close()
 
+def update_player_name(discord_id, new_name):
+    """Met à jour le nom d'un joueur en base de données"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                UPDATE players 
+                SET name = %s 
+                WHERE discord_id = %s
+            ''', (new_name, str(discord_id)))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur update_player_name: {e}")
+        return False
+    finally:
+        conn.close()
+
 def get_player(discord_id):
     """Récupère un joueur"""
     conn = get_connection()
@@ -201,7 +223,7 @@ def create_player(discord_id, name):
             c.execute('''
                 INSERT INTO players (discord_id, name) 
                 VALUES (%s, %s) 
-                ON CONFLICT (discord_id) DO NOTHING
+                ON CONFLICT (discord_id) DO UPDATE SET name = EXCLUDED.name
             ''', (str(discord_id), name))
             conn.commit()
             return True
@@ -679,33 +701,4 @@ if __name__ == '__main__':
     
     if not DATABASE_URL:
         print("❌ DATABASE_URL manquant!")
-        exit(1)
-    
-    print("🚀 Lancement du bot ELO ultra simplifié...")
-    print(f"🐘 Base PostgreSQL: {DATABASE_URL[:50]}...")
-    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES} simultanés")
-    print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
-    print(f"🔔 Rôle ping: {PING_ROLE_ID}")
-    print(f"🚨 Pénalité dodge: {DODGE_PENALTY_BASE}+ ELO")
-    print("📈 Système: 1 win/loss/dodge par MATCH")
-    
-    # Charger les commandes après le démarrage du bot
-    @bot.event
-    async def on_ready():
-        print(f'🤖 Bot connecté: {bot.user}')
-        print(f'🐘 Connexion PostgreSQL: {"✅" if get_connection() else "❌"}')
-        init_db()
-        
-        # Charger les commandes
-        from commands import setup_commands as setup_bot_commands
-        await setup_bot_commands(bot)
-        
-        # Synchroniser les commandes slash
-        try:
-            synced = await bot.tree.sync()
-            print(f'📡 {len(synced)} commande(s) slash synchronisée(s)')
-        except Exception as e:
-            print(f'❌ Erreur synchronisation: {e}')
-    
-    # Lancer le bot
-    bot.run(TOKEN)
+        exit(1
