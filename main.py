@@ -701,4 +701,4 @@ if __name__ == '__main__':
     
     if not DATABASE_URL:
         print("❌ DATABASE_URL manquant!")
-        exit(1
+        exit(1)
