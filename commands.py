@@ -145,7 +145,7 @@ class MatchResultView(discord.ui.View):
                 old_elo = winner_elos[i]
                 change = winner_elo_changes[i]
                 new_elo = old_elo + change
-                result_message += f"{player['name']}: {old_elo} → {new_elo} (+{change})\n"
+                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} (+{change})\n"
             
             losing_color = "🔴" if team1_wins else "🔵"
             result_message += f"\n{losing_color} PERDANTS:\n"
@@ -153,7 +153,7 @@ class MatchResultView(discord.ui.View):
                 old_elo = loser_elos[i]
                 change = loser_elo_changes[i]
                 new_elo = old_elo + change
-                result_message += f"{player['name']}: {old_elo} → {new_elo} ({change:+})\n"
+                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} ({change:+})\n"
             
             # Statistiques
             elo_diff = abs(winner_avg - loser_avg)
@@ -278,25 +278,25 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
                 # Créer les équipes aléatoires
                 team1_ids, team2_ids = create_random_teams(players_list)
                 
-                # Récupérer les noms des joueurs
-                team1_names = []
-                team2_names = []
+                # Récupérer les noms des joueurs et créer les mentions
+                team1_mentions = []
+                team2_mentions = []
                 
                 for player_id in team1_ids:
                     player = get_player(player_id)
                     if player:
-                        team1_names.append(player['name'])
+                        team1_mentions.append(f"<@{player_id}>")
                 
                 for player_id in team2_ids:
                     player = get_player(player_id)
                     if player:
-                        team2_names.append(player['name'])
+                        team2_mentions.append(f"<@{player_id}>")
                 
                 # Sélectionner 3 maps aléatoires
                 selected_maps = select_random_maps(3)
                 
-                team1_text = '\n'.join([f"• {name}" for name in team1_names])
-                team2_text = '\n'.join([f"• {name}" for name in team2_names])
+                team1_text = '\n'.join([f"• {mention}" for mention in team1_mentions])
+                team2_text = '\n'.join([f"• {mention}" for mention in team2_mentions])
                 maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
                 
                 # Créer le lien cliquable
