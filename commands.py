@@ -414,7 +414,13 @@ async def show_elo_cmd(ctx):
         await ctx.send(message, suppress_embeds=True)
         return
     
-    name = player['name']
+    # Récupérer le pseudo Discord actuel (comme dans leaderboard)
+    try:
+        member = ctx.guild.get_member(int(player['discord_id']))
+        display_name = member.display_name if member else player['name']
+    except:
+        display_name = player['name']
+    
     elo = player['elo']
     wins = player['wins']
     losses = player['losses']
@@ -427,7 +433,7 @@ async def show_elo_cmd(ctx):
     players = get_leaderboard()
     rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
     
-    message = (f"📊 {name}\n"
+    message = (f"📊 {display_name}\n"
               f"ELO: {elo} points\n"
               f"Rang: #{rank}/{len(players)}\n"
               f"Victoires: {wins}\n"
