@@ -11,17 +11,6 @@ from discord import app_commands
 from typing import Optional, Literal
 import asyncio
 
-# Import des fonctions depuis main.py
-from main import (
-    get_player, create_player, update_player_elo, get_leaderboard,
-    create_lobby, get_lobby, add_player_to_lobby, remove_player_from_lobby,
-    get_all_lobbies, create_random_teams, select_random_maps,
-    calculate_elo_change, get_connection, get_cooldown_info,
-    MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES, PING_ROLE_ID,
-    record_dodge, get_player_dodge_count, calculate_dodge_penalty,
-    save_match_history, undo_last_match
-)
-
 # Salon de validation des résultats
 RESULT_CHANNEL_ID = 1408595087331430520
 
@@ -51,6 +40,12 @@ class MatchResultView(discord.ui.View):
     async def handle_match_result(self, interaction: discord.Interaction, team1_wins: bool):
         """Traite le résultat du match"""
         try:
+            # Import here to avoid circular imports
+            from main import (
+                get_player, update_player_elo, calculate_elo_change,
+                get_connection, save_match_history
+            )
+            
             # Vérifier les permissions admin
             if not interaction.user.guild_permissions.administrator:
                 await interaction.response.send_message("❌ Seuls les administrateurs peuvent valider les résultats!", ephemeral=True)
@@ -210,6 +205,11 @@ class MatchResultView(discord.ui.View):
 
 async def create_lobby_cmd(ctx, room_code: str = None):
     """!create <code_room> - Créer un lobby"""
+    from main import (
+        get_player, create_player, create_lobby, add_player_to_lobby,
+        get_all_lobbies, MAX_CONCURRENT_LOBBIES, PING_ROLE_ID
+    )
+    
     if not room_code:
         message = "❌ Usage: !create <code_room>"
         await ctx.send(message, suppress_embeds=True)
@@ -251,6 +251,11 @@ async def create_lobby_cmd(ctx, room_code: str = None):
 
 async def join_lobby_cmd(ctx, lobby_id: int = None):
     """!join <id> - Rejoindre un lobby"""
+    from main import (
+        get_player, create_player, add_player_to_lobby, get_lobby,
+        create_random_teams, select_random_maps, get_connection
+    )
+    
     if lobby_id is None:
         message = "❌ Usage: !join <id_lobby>"
         await ctx.send(message, suppress_embeds=True)
@@ -350,6 +355,8 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
 
 async def leave_lobby_cmd(ctx):
     """!leave - Quitter votre lobby"""
+    from main import remove_player_from_lobby
+    
     success, msg = remove_player_from_lobby(ctx.author.id)
     
     if success:
@@ -361,6 +368,10 @@ async def leave_lobby_cmd(ctx):
 
 async def list_lobbies_cmd(ctx):
     """!lobbies - Liste des lobbies actifs"""
+    from main import (
+        get_all_lobbies, get_cooldown_info, MAX_CONCURRENT_LOBBIES
+    )
+    
     lobbies = get_all_lobbies()
     cooldown_info = get_cooldown_info()
     
@@ -393,6 +404,8 @@ async def list_lobbies_cmd(ctx):
 
 async def show_elo_cmd(ctx):
     """!elo - Voir son ELO et rang"""
+    from main import get_player, get_leaderboard, get_player_dodge_count
+    
     player = get_player(ctx.author.id)
     
     if not player:
@@ -428,6 +441,8 @@ async def show_elo_cmd(ctx):
 
 async def leaderboard_cmd(ctx):
     """!leaderboard - Classement des joueurs"""
+    from main import get_leaderboard, get_player
+    
     players = get_leaderboard()
     
     if not players:
@@ -476,6 +491,11 @@ async def leaderboard_cmd(ctx):
 
 async def lobby_status_cmd(ctx):
     """!status - Statut des lobbies et cooldown"""
+    from main import (
+        get_all_lobbies, get_cooldown_info, get_leaderboard,
+        MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES
+    )
+    
     lobbies = get_all_lobbies()
     cooldown_info = get_cooldown_info()
     
@@ -513,6 +533,11 @@ async def record_match_result(
     score: Optional[Literal["2-0", "2-1"]] = None
 ):
     """Enregistrer le résultat d'un match avec gestion des dodges"""
+    from main import (
+        get_player, create_player, update_player_elo, calculate_elo_change,
+        record_dodge, get_player_dodge_count, calculate_dodge_penalty
+    )
+    
     # Répondre immédiatement pour éviter l'expiration
     await interaction.response.send_message("⏳ Traitement du match en cours...", ephemeral=True)
     
@@ -652,6 +677,8 @@ async def old_record_match_result(ctx, winner1: discord.Member, winner2: discord
 
 async def reset_cooldown_cmd(ctx):
     """!resetcd - Reset le cooldown (admin seulement)"""
+    from main import get_connection, LOBBY_COOLDOWN_MINUTES
+    
     if not ctx.author.guild_permissions.administrator:
         message = "❌ Commande réservée aux administrateurs"
         await ctx.send(message, suppress_embeds=True)
@@ -683,6 +710,8 @@ async def reset_cooldown_cmd(ctx):
 
 async def clear_lobbies_cmd(ctx):
     """!clearlobbies - Supprimer tous les lobbies (admin seulement)"""
+    from main import get_connection
+    
     if not ctx.author.guild_permissions.administrator:
         message = "❌ Commande réservée aux administrateurs"
         await ctx.send(message, suppress_embeds=True)
@@ -712,6 +741,8 @@ async def clear_lobbies_cmd(ctx):
 
 async def reduce_losses_cmd(ctx):
     """!reducelosses - Retirer 3 défaites et ajouter 30 ELO aux joueurs avec 4+ défaites (admin seulement)"""
+    from main import get_connection
+    
     if not ctx.author.guild_permissions.administrator:
         message = "❌ Commande réservée aux administrateurs"
         await ctx.send(message, suppress_embeds=True)
@@ -799,6 +830,8 @@ async def reduce_losses_cmd(ctx):
 
 async def undo_match_cmd(ctx):
     """!undo - Annuler le dernier match (admin seulement)"""
+    from main import undo_last_match
+    
     if not ctx.author.guild_permissions.administrator:
         message = "❌ Commande réservée aux administrateurs"
         await ctx.send(message, suppress_embeds=True)
@@ -835,6 +868,9 @@ async def undo_match_cmd(ctx):
 
 async def setup_commands(bot):
     """Configure toutes les commandes du bot"""
+    from main import (
+        MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES, PING_ROLE_ID
+    )
     
     # Commandes prefix
     @bot.command(name='create')
