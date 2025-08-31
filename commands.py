@@ -1399,6 +1399,85 @@ async def undo_match_cmd(ctx):
     
     await ctx.send(message, suppress_embeds=True)
 
+async def add_elo_cmd(ctx, member: discord.Member, amount: int):
+    """!addelo @joueur montant - Ajouter de l'ELO à un joueur (admin seulement)"""
+    from main import get_player, create_player, update_player_elo_only
+    
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    if amount <= 0:
+        message = "❌ Le montant doit être positif"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Vérifier/créer le joueur
+    player = get_player(member.id)
+    if not player:
+        if not create_player(member.id, member.display_name):
+            message = "❌ Erreur: Impossible de créer le profil du joueur"
+            await ctx.send(message, suppress_embeds=True)
+            return
+        player = get_player(member.id)
+    
+    old_elo = player['elo']
+    new_elo = old_elo + amount
+    
+    if update_player_elo_only(member.id, new_elo):
+        message = f"✅ ELO AJOUTÉ\n"
+        message += f"Joueur: {member.display_name}\n"
+        message += f"Ancien ELO: {old_elo}\n"
+        message += f"Nouveau ELO: {new_elo} (+{amount})\n"
+        message += f"Modifié par: {ctx.author.display_name}"
+    else:
+        message = "❌ Erreur lors de la mise à jour de l'ELO"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def remove_elo_cmd(ctx, member: discord.Member, amount: int):
+    """!removeelo @joueur montant - Retirer de l'ELO à un joueur (admin seulement)"""
+    from main import get_player, create_player, update_player_elo_only
+    
+    if not ctx.author.guild_permissions.administrator:
+        message = "❌ Commande réservée aux administrateurs"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    if amount <= 0:
+        message = "❌ Le montant doit être positif"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Vérifier/créer le joueur
+    player = get_player(member.id)
+    if not player:
+        if not create_player(member.id, member.display_name):
+            message = "❌ Erreur: Impossible de créer le profil du joueur"
+            await ctx.send(message, suppress_embeds=True)
+            return
+        player = get_player(member.id)
+    
+    old_elo = player['elo']
+    new_elo = max(0, old_elo - amount)  # L'ELO ne peut pas descendre en dessous de 0
+    actual_removed = old_elo - new_elo
+    
+    if update_player_elo_only(member.id, new_elo):
+        message = f"✅ ELO RETIRÉ\n"
+        message += f"Joueur: {member.display_name}\n"
+        message += f"Ancien ELO: {old_elo}\n"
+        message += f"Nouveau ELO: {new_elo} (-{actual_removed})\n"
+        
+        if actual_removed < amount:
+            message += f"⚠️ Seulement {actual_removed} ELO retiré (minimum 0)\n"
+        
+        message += f"Modifié par: {ctx.author.display_name}"
+    else:
+        message = "❌ Erreur lors de la mise à jour de l'ELO"
+    
+    await ctx.send(message, suppress_embeds=True)
+
 # ================================
 # GESTION DES RÉACTIONS D'ANNULATION
 # ================================
@@ -1511,6 +1590,22 @@ async def setup_commands(bot):
     async def _undo(ctx):
         await undo_match_cmd(ctx)
     
+    @bot.command(name='addelo')
+    async def _addelo(ctx, member: discord.Member = None, amount: int = None):
+        if member is None or amount is None:
+            message = "❌ Usage: !addelo @joueur montant"
+            await ctx.send(message, suppress_embeds=True)
+            return
+        await add_elo_cmd(ctx, member, amount)
+    
+    @bot.command(name='removeelo')
+    async def _removeelo(ctx, member: discord.Member = None, amount: int = None):
+        if member is None or amount is None:
+            message = "❌ Usage: !removeelo @joueur montant"
+            await ctx.send(message, suppress_embeds=True)
+            return
+        await remove_elo_cmd(ctx, member, amount)
+    
     # Commande slash admin pour validation manuelle
     @app_commands.command(name="result", description="Enregistrer manuellement un résultat de match (admin uniquement)")
     @app_commands.describe(
@@ -1564,4 +1659,4 @@ async def setup_commands(bot):
     print("🗳️ Vote des joueurs activé (majorité 4/6 ou unanimité)")
     print("↩️ Annulation par réaction activée")
     print("🚨 Système anti-dodge activé")
-    print("🔧 Commandes admin: !resetcd, !clearlobbies, !undo, /result")
+    print("🔧 Commandes admin: !resetcd, !clearlobbies, !undo, /result, !addelo, !removeelo")
