@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Ultra Simplifié - FICHIER PRINCIPAL
-Configuration, base de données et lancement du bot avec système de dodge corrigé
+Configuration, base de données et lancement du bot avec système de vote des joueurs
 """
 
 import discord
@@ -13,6 +13,7 @@ import os
 import logging
 import random
 from datetime import datetime, timedelta
+import json
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -55,6 +56,7 @@ DODGE_PENALTY_MULTIPLIER = 5  # Multiplicateur par dodge supplémentaire
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # Nécessaire pour get_member
+intents.reactions = True  # Nécessaire pour les réactions d'annulation
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # ================================
@@ -160,6 +162,15 @@ def init_db():
                 )
             ''')
             
+            # Table pour tracker les messages de match (pour annulation par réaction)
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS match_messages (
+                    message_id BIGINT PRIMARY KEY,
+                    match_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             # Insérer une ligne pour le cooldown si elle n'existe pas
             c.execute('''
                 INSERT INTO lobby_cooldown (id, last_creation) 
@@ -171,6 +182,67 @@ def init_db():
             logger.info("Base de données initialisée avec succès")
     except Exception as e:
         logger.error(f"Erreur initialisation DB: {e}")
+    finally:
+        conn.close()
+
+def save_match_message_id(message_id):
+    """Sauvegarde l'ID d'un message de match pour l'annulation par réaction"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                INSERT INTO match_messages (message_id) 
+                VALUES (%s)
+            ''', (message_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur save_match_message_id: {e}")
+        return False
+    finally:
+        conn.close()
+
+def is_match_message(message_id):
+    """Vérifie si un message est un message de match valide"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                SELECT COUNT(*) as count 
+                FROM match_messages 
+                WHERE message_id = %s
+            ''', (message_id,))
+            result = c.fetchone()
+            return result['count'] > 0 if result else False
+    except Exception as e:
+        logger.error(f"Erreur is_match_message: {e}")
+        return False
+    finally:
+        conn.close()
+
+def remove_match_message_id(message_id):
+    """Retire un message de la liste des messages de match"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                DELETE FROM match_messages 
+                WHERE message_id = %s
+            ''', (message_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Erreur remove_match_message_id: {e}")
+        return False
     finally:
         conn.close()
 
@@ -255,7 +327,7 @@ def update_player_elo_only(discord_id, new_elo):
         conn.close()
 
 def update_player_elo(discord_id, new_elo, won):
-    """Met à jour l'ELO d'un joueur (ANCIENNE VERSION - gardée pour compatibilité)"""
+    """Met à jour l'ELO d'un joueur avec win/loss"""
     conn = get_connection()
     if not conn:
         return False
@@ -348,16 +420,13 @@ def save_match_history(winners, losers, winner_elo_changes, loser_elo_changes, d
     
     try:
         with conn.cursor() as c:
-            # Convertir les listes en JSON string
-            import json
-            
             match_data = {
                 'winners': [str(w.id) for w in winners],
                 'losers': [str(l.id) for l in losers],
                 'winner_elo_changes': winner_elo_changes,
                 'loser_elo_changes': loser_elo_changes,
                 'dodge_player_id': str(dodge_player_id) if dodge_player_id else None,
-                'winner_team_leader': str(winners[0].id),  # Pour les win/loss d'équipe
+                'winner_team_leader': str(winners[0].id),
                 'loser_team_leader': str(losers[0].id)
             }
             
@@ -392,29 +461,26 @@ def undo_last_match():
             if not last_match:
                 return False, "Aucun match à annuler"
             
-            import json
             match_data = json.loads(last_match['match_data'])
             
-            # Annuler les changements d'ELO pour les gagnants (sans retirer de victoires individuelles)
+            # Annuler les changements d'ELO pour les gagnants
             winners = match_data['winners']
             winner_changes = match_data['winner_elo_changes']
             
             for i, player_id in enumerate(winners):
                 old_change = winner_changes[i]
-                # Inverser le changement d'ELO seulement
                 c.execute('''
                     UPDATE players 
                     SET elo = elo - %s
                     WHERE discord_id = %s
                 ''', (old_change, player_id))
             
-            # Annuler les changements d'ELO pour les perdants (sans retirer de défaites individuelles)
+            # Annuler les changements d'ELO pour les perdants
             losers = match_data['losers']
             loser_changes = match_data['loser_elo_changes']
             
             for i, player_id in enumerate(losers):
                 old_change = loser_changes[i]
-                # Inverser le changement d'ELO seulement
                 c.execute('''
                     UPDATE players 
                     SET elo = elo - %s
