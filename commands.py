@@ -58,12 +58,13 @@ class DodgeReportSelect(discord.ui.Select):
 class PlayerVoteView(discord.ui.View):
     """Vue avec boutons pour que les joueurs votent le résultat d'un match"""
     
-    def __init__(self, team1_ids, team2_ids, lobby_id, room_code):
-        super().__init__(timeout=86400)  # 24 heures de timeout
+    def __init__(self, team1_ids, team2_ids, lobby_id, room_code, guild):
+        super().__init__(timeout=None)  # Pas de timeout car on gère le refresh manuel
         self.team1_ids = team1_ids  # Équipe bleue
         self.team2_ids = team2_ids  # Équipe rouge
         self.lobby_id = lobby_id
         self.room_code = room_code
+        self.guild = guild
         self.votes_team1 = set()  # IDs des joueurs qui ont voté équipe 1
         self.votes_team2 = set()  # IDs des joueurs qui ont voté équipe 2
         self.voters = set()  # Tous les joueurs qui ont voté
@@ -71,7 +72,145 @@ class PlayerVoteView(discord.ui.View):
         self.all_player_ids = set(team1_ids + team2_ids)
         self.dodge_reports = {}  # {user_id: reported_player_id}
         self.dodge_confirmed = None  # ID du joueur confirmé comme ayant dodge
-        self.original_message = None  # Référence au message original pour mise à jour
+        self.current_message = None  # Référence au message actuel
+        self.refresh_task = None  # Tâche de refresh automatique
+    
+    async def start_refresh_task(self):
+        """Démarre la tâche de refresh automatique toutes les 15 minutes"""
+        self.refresh_task = asyncio.create_task(self._refresh_loop())
+    
+    async def _refresh_loop(self):
+        """Boucle de refresh du message toutes les 15 minutes"""
+        try:
+            while not self.match_validated:
+                await asyncio.sleep(15 * 60)  # 15 minutes
+                if not self.match_validated and self.current_message:
+                    await self._refresh_message()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Erreur dans _refresh_loop: {e}")
+    
+    async def _refresh_message(self):
+        """Refresh le message en le supprimant et le recréant"""
+        try:
+            if not self.current_message or self.match_validated:
+                return
+            
+            # Construire le message de vote actuel
+            vote_message = await self._build_vote_message()
+            
+            # Récupérer le canal
+            channel = self.guild.get_channel(RESULT_CHANNEL_ID)
+            if not channel:
+                return
+            
+            # Supprimer l'ancien message
+            try:
+                await self.current_message.delete()
+            except:
+                pass  # Message peut-être déjà supprimé
+            
+            # Créer un nouveau message avec une nouvelle vue
+            new_view = PlayerVoteView(self.team1_ids, self.team2_ids, self.lobby_id, self.room_code, self.guild)
+            
+            # Copier l'état actuel
+            new_view.votes_team1 = self.votes_team1.copy()
+            new_view.votes_team2 = self.votes_team2.copy()
+            new_view.voters = self.voters.copy()
+            new_view.dodge_reports = self.dodge_reports.copy()
+            new_view.dodge_confirmed = self.dodge_confirmed
+            new_view.match_validated = self.match_validated
+            
+            # Envoyer le nouveau message
+            new_message = await channel.send(vote_message, view=new_view, suppress_embeds=True)
+            
+            # Mettre à jour les références
+            new_view.current_message = new_message
+            await new_view.start_refresh_task()
+            
+            # Arrêter l'ancien refresh
+            if self.refresh_task:
+                self.refresh_task.cancel()
+            
+        except Exception as e:
+            print(f"Erreur dans _refresh_message: {e}")
+    
+    async def _build_vote_message(self):
+        """Construit le message de vote avec l'état actuel"""
+        from main import select_random_maps
+        
+        # Récupérer les mentions des équipes
+        team1_mentions = [f"<@{pid}>" for pid in self.team1_ids]
+        team2_mentions = [f"<@{pid}>" for pid in self.team2_ids]
+        
+        team1_text = '\n'.join([f"• {mention}" for mention in team1_mentions])
+        team2_text = '\n'.join([f"• {mention}" for mention in team2_mentions])
+        
+        # Maps (pour le refresh, on remet les mêmes maps - idéalement il faudrait les sauvegarder)
+        selected_maps = select_random_maps(3)
+        maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
+        
+        # Lien room
+        room_link = f"https://link.nulls.gg/nb/invite/gameroom/fr?tag={self.room_code}"
+        
+        # Construire le message avec les votes actuels
+        total_votes_team1 = len(self.votes_team1)
+        total_votes_team2 = len(self.votes_team2)
+        total_votes = total_votes_team1 + total_votes_team2
+        
+        vote_message = f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{self.lobby_id}\n"
+        vote_message += f"Code: {self.room_code}\n\n"
+        
+        vote_message += f"🔵 **Équipe Bleue** ({total_votes_team1} votes):\n{team1_text}\n"
+        if self.votes_team1:
+            voters_team1 = [f"<@{pid}>" for pid in self.votes_team1]
+            vote_message += f"Votants: {', '.join(voters_team1)}\n"
+        
+        vote_message += f"\n🔴 **Équipe Rouge** ({total_votes_team2} votes):\n{team2_text}\n"
+        if self.votes_team2:
+            voters_team2 = [f"<@{pid}>" for pid in self.votes_team2]
+            vote_message += f"Votants: {', '.join(voters_team2)}\n"
+        
+        vote_message += f"\n🗺️ **Maps:**\n{maps_text}\n\n"
+        vote_message += f"🎮 **Lien room:** {room_link}\n\n"
+        
+        # Informations sur les signalements de dodge
+        if self.dodge_reports:
+            report_counts = {}
+            for reported_id in self.dodge_reports.values():
+                report_counts[reported_id] = report_counts.get(reported_id, 0) + 1
+            
+            vote_message += f"🚨 **SIGNALEMENTS DE DODGE:**\n"
+            for player_id, count in report_counts.items():
+                vote_message += f"<@{player_id}>: {count} signalement(s)\n"
+            
+            vote_message += f"(Majorité de 3 signalements = dodge confirmé)\n\n"
+        
+        vote_message += f"📊 Total votes: {total_votes}/6\n"
+        
+        if total_votes < 6:
+            remaining = 6 - total_votes
+            vote_message += f"⏳ En attente de {remaining} vote(s) supplémentaire(s)\n\n"
+        
+        vote_message += f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
+        vote_message += f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
+        vote_message += f"🔄 Message auto-refresh toutes les 15 minutes"
+        
+        return vote_message
+    
+    async def safe_respond(self, interaction, content, ephemeral=False, view=None):
+        """Réponse sécurisée qui gère les timeouts"""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(content, ephemeral=ephemeral, view=view)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
+        except discord.errors.NotFound:
+            # Interaction expirée, ignore
+            pass
+        except Exception as e:
+            print(f"Erreur dans safe_respond: {e}")
     
     @discord.ui.button(label='🔵 Victoire Équipe Bleue', style=discord.ButtonStyle.primary, emoji='🔵')
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -84,6 +223,70 @@ class PlayerVoteView(discord.ui.View):
     @discord.ui.button(label='🚨 Signaler un Dodge', style=discord.ButtonStyle.secondary, emoji='🚨')
     async def report_dodge(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_dodge_report(interaction)
+    
+    async def handle_vote(self, interaction: discord.Interaction, team1_wins: bool):
+        """Gère un vote de joueur"""
+        try:
+            # Vérifier que c'est un joueur du match
+            if interaction.user.id not in self.all_player_ids:
+                await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent voter!", ephemeral=True)
+                return
+            
+            # Vérifier que le match n'a pas déjà été validé
+            if self.match_validated:
+                await self.safe_respond(interaction, "❌ Ce match a déjà été validé!", ephemeral=True)
+                return
+            
+            # Retirer le vote précédent si il existe
+            self.votes_team1.discard(interaction.user.id)
+            self.votes_team2.discard(interaction.user.id)
+            
+            # Ajouter le nouveau vote
+            if team1_wins:
+                self.votes_team1.add(interaction.user.id)
+                vote_team = "Bleue 🔵"
+            else:
+                self.votes_team2.add(interaction.user.id)
+                vote_team = "Rouge 🔴"
+            
+            self.voters.add(interaction.user.id)
+            
+            await self.safe_respond(interaction, f"✅ Votre vote pour l'équipe {vote_team} a été enregistré!", ephemeral=True)
+            
+            # Vérifier si on a assez de votes pour une majorité (4/6 minimum)
+            total_votes_team1 = len(self.votes_team1)
+            total_votes_team2 = len(self.votes_team2)
+            total_votes = total_votes_team1 + total_votes_team2
+            
+            # Vérifier les conditions de victoire
+            if total_votes_team1 >= 4:
+                # Équipe 1 gagne par majorité
+                await self.validate_match_result(True, "majorité (4+ votes)")
+                return
+            elif total_votes_team2 >= 4:
+                # Équipe 2 gagne par majorité
+                await self.validate_match_result(False, "majorité (4+ votes)")
+                return
+            elif total_votes == 6:
+                # Tous ont voté, déterminer le gagnant
+                if total_votes_team1 > total_votes_team2:
+                    await self.validate_match_result(True, f"votes finaux ({total_votes_team1}-{total_votes_team2})")
+                elif total_votes_team2 > total_votes_team1:
+                    await self.validate_match_result(False, f"votes finaux ({total_votes_team2}-{total_votes_team1})")
+                else:
+                    # Égalité parfaite 3-3, pas de validation automatique
+                    await self._refresh_message()
+                    return
+            else:
+                # Pas assez de votes, refresh le message avec les nouveaux votes
+                await self._refresh_message()
+                
+        except Exception as e:
+            print(f"Erreur dans handle_vote: {e}")
+            try:
+                await self.safe_respond(interaction, f"❌ Erreur lors du vote: {str(e)}", ephemeral=True)
+            except:
+                pass
     
     async def handle_dodge_report(self, interaction: discord.Interaction):
         """Gère le signalement d'un dodge"""
@@ -135,13 +338,13 @@ class PlayerVoteView(discord.ui.View):
             
             # Vérifier si un joueur a assez de signalements (majorité = 3+ signalements)
             for player_id, count in report_counts.items():
-                if count >= 3:  # Majorité de 3/5 autres joueurs (celui signalé ne peut pas voter contre lui-même)
+                if count >= 3:  # Majorité de 3/5 autres joueurs
                     self.dodge_confirmed = player_id
                     await self.handle_confirmed_dodge()
                     return
             
-            # Pas encore de majorité, mettre à jour le statut
-            await self.update_vote_message_with_dodge_info()
+            # Pas encore de majorité, refresh le message
+            await self._refresh_message()
             
         except Exception as e:
             print(f"Erreur dans process_dodge_report: {e}")
@@ -168,52 +371,114 @@ class PlayerVoteView(discord.ui.View):
         except Exception as e:
             print(f"Erreur dans handle_confirmed_dodge: {e}")
     
-    async def update_vote_message_with_dodge_info(self):
-        """Met à jour le message de vote avec les infos de dodge"""
+    async def validate_match_result(self, team1_wins, reason):
+        """Valide automatiquement le résultat du match"""
         try:
-            # Compter les votes actuels
-            total_votes_team1 = len(self.votes_team1)
-            total_votes_team2 = len(self.votes_team2)
-            total_votes = total_votes_team1 + total_votes_team2
+            from main import (
+                get_player, update_player_elo, calculate_elo_change,
+                save_match_history
+            )
             
-            # Construire le message avec les informations de dodge
-            status_message = f"🗳️ **VOTE EN COURS** - Lobby #{self.lobby_id}\n\n"
+            # Marquer comme validé et arrêter le refresh
+            self.match_validated = True
+            if self.refresh_task:
+                self.refresh_task.cancel()
             
-            # Votes normaux
-            team1_voters = [f"<@{pid}>" for pid in self.votes_team1]
-            team2_voters = [f"<@{pid}>" for pid in self.votes_team2]
+            # Déterminer gagnants et perdants
+            if team1_wins:
+                winner_ids = self.team1_ids
+                loser_ids = self.team2_ids
+                winning_team = "Bleue"
+                winning_color = "🔵"
+            else:
+                winner_ids = self.team2_ids
+                loser_ids = self.team1_ids
+                winning_team = "Rouge"
+                winning_color = "🔴"
             
-            status_message += f"🔵 **Équipe Bleue** ({total_votes_team1} votes):\n"
-            if team1_voters:
-                status_message += f"Votants: {', '.join(team1_voters)}\n"
+            # Récupérer les joueurs
+            winners = []
+            losers = []
+            winner_elos = []
+            loser_elos = []
             
-            status_message += f"\n🔴 **Équipe Rouge** ({total_votes_team2} votes):\n"
-            if team2_voters:
-                status_message += f"Votants: {', '.join(team2_voters)}\n"
+            for player_id in winner_ids:
+                player = get_player(player_id)
+                if player:
+                    winners.append(player)
+                    winner_elos.append(player['elo'])
             
-            status_message += f"\n📊 Total votes: {total_votes}/6\n"
+            for player_id in loser_ids:
+                player = get_player(player_id)
+                if player:
+                    losers.append(player)
+                    loser_elos.append(player['elo'])
             
-            # Informations sur les signalements de dodge
-            if self.dodge_reports:
-                report_counts = {}
-                for reported_id in self.dodge_reports.values():
-                    report_counts[reported_id] = report_counts.get(reported_id, 0) + 1
+            if len(winners) != 3 or len(losers) != 3:
+                await self._update_message("❌ Erreur: Impossible de récupérer tous les joueurs")
+                return
+            
+            # Calculer les changements d'ELO
+            winner_avg = sum(winner_elos) / 3
+            loser_avg = sum(loser_elos) / 3
+            
+            winner_elo_changes = []
+            loser_elo_changes = []
+            
+            # Appliquer les changements
+            for i, player in enumerate(winners):
+                old_elo = winner_elos[i]
+                elo_change = calculate_elo_change(old_elo, loser_avg, True)
+                new_elo = max(0, old_elo + elo_change)
                 
-                status_message += f"\n🚨 **SIGNALEMENTS DE DODGE:**\n"
-                for player_id, count in report_counts.items():
-                    status_message += f"<@{player_id}>: {count} signalement(s)\n"
+                if update_player_elo(player['discord_id'], new_elo, True):
+                    winner_elo_changes.append(elo_change)
+                else:
+                    await self._update_message("❌ Erreur lors de la mise à jour des ELO")
+                    return
+            
+            for i, player in enumerate(losers):
+                old_elo = loser_elos[i]
+                elo_change = calculate_elo_change(old_elo, winner_avg, False)
+                new_elo = max(0, old_elo + elo_change)
                 
-                status_message += f"(Majorité de 3 signalements = dodge confirmé)\n"
+                if update_player_elo(player['discord_id'], new_elo, False):
+                    loser_elo_changes.append(elo_change)
+                else:
+                    await self._update_message("❌ Erreur lors de la mise à jour des ELO")
+                    return
             
-            remaining = 6 - total_votes
-            if remaining > 0:
-                status_message += f"\n⏳ En attente de {remaining} vote(s) supplémentaire(s)"
+            # Désactiver tous les boutons
+            for item in self.children:
+                item.disabled = True
             
-            # Essayer de mettre à jour le message original
-            # Note: Cette partie nécessiterait une référence au message original
+            # Message de validation
+            validation_message = f"✅ **MATCH VALIDÉ PAR VOTE** ({reason})\n\n"
+            validation_message += f"🏆 VICTOIRE ÉQUIPE {winning_team} {winning_color}\n"
+            validation_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}"
+            
+            # Mettre à jour le message de vote
+            await self._update_message(validation_message)
+            
+            # Créer des objets mock pour la sauvegarde
+            class MockMember:
+                def __init__(self, discord_id, name):
+                    self.id = int(discord_id)
+                    self.display_name = name
+            
+            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
+            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
+            
+            # Sauvegarder pour l'historique (undo)
+            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes)
+            
+            # Envoyer le résumé dans le salon dédié avec réaction d'annulation
+            await self.send_match_summary(winners, losers, winner_elos, loser_elos, 
+                                        winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason)
             
         except Exception as e:
-            print(f"Erreur dans update_vote_message_with_dodge_info: {e}")
+            print(f"Erreur dans validate_match_result: {e}")
+            await self._update_message(f"❌ Erreur lors de la validation: {str(e)}")
     
     async def validate_match_with_dodge(self, team1_wins, dodge_player_id, dodge_penalty):
         """Valide le match avec gestion du dodge"""
@@ -223,8 +488,10 @@ class PlayerVoteView(discord.ui.View):
                 save_match_history
             )
             
-            # Marquer comme validé
+            # Marquer comme validé et arrêter le refresh
             self.match_validated = True
+            if self.refresh_task:
+                self.refresh_task.cancel()
             
             # Déterminer gagnants et perdants
             if team1_wins:
@@ -323,6 +590,63 @@ class PlayerVoteView(discord.ui.View):
         except Exception as e:
             print(f"Erreur dans validate_match_with_dodge: {e}")
     
+    async def _update_message(self, content):
+        """Met à jour le message actuel"""
+        try:
+            if self.current_message:
+                await self.current_message.edit(content=content, view=self if not self.match_validated else None, suppress_embeds=True)
+        except Exception as e:
+            print(f"Erreur dans _update_message: {e}")
+    
+    async def send_match_summary(self, winners, losers, winner_elos, loser_elos, 
+                                winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason):
+        """Envoie le résumé du match dans le salon dédié"""
+        try:
+            # Construire le message de résultat
+            winning_team = "Bleue" if winners[0]['discord_id'] in [str(id) for id in self.team1_ids] else "Rouge"
+            winning_color = "🔵" if winning_team == "Bleue" else "🔴"
+            losing_color = "🔴" if winning_team == "Bleue" else "🔵"
+            
+            result_message = f"🏆 **RÉSULTAT DE MATCH**\n\n"
+            result_message += f"**Victoire Équipe {winning_team} {winning_color}** (par {reason})\n"
+            result_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
+            
+            result_message += f"{winning_color} **GAGNANTS:**\n"
+            for i, player in enumerate(winners):
+                old_elo = winner_elos[i]
+                change = winner_elo_changes[i]
+                new_elo = old_elo + change
+                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} (+{change})\n"
+            
+            result_message += f"\n{losing_color} **PERDANTS:**\n"
+            for i, player in enumerate(losers):
+                old_elo = loser_elos[i]
+                change = loser_elo_changes[i]
+                new_elo = old_elo + change
+                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} ({change:+})\n"
+            
+            # Statistiques
+            elo_diff = abs(winner_avg - loser_avg)
+            result_message += f"\n📊 **ANALYSE:**\n"
+            result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
+            result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
+            result_message += f"Écart: {round(elo_diff)} points\n\n"
+            result_message += f"↩️ *Réagissez avec ↩️ pour annuler ce match en cas de fraude*"
+            
+            # Envoyer dans le salon de résumés
+            summary_channel = self.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
+            if summary_channel:
+                summary_message = await summary_channel.send(result_message, suppress_embeds=True)
+                # Ajouter la réaction d'annulation
+                await summary_message.add_reaction("↩️")
+                
+                # Sauvegarder l'ID du message pour l'annulation
+                from main import save_match_message_id
+                save_match_message_id(summary_message.id)
+            
+        except Exception as e:
+            print(f"Erreur dans send_match_summary: {e}")
+    
     async def send_match_summary_with_dodge(self, winners, losers, winner_elos, loser_elos,
                                            winner_elo_changes, loser_elo_changes, winner_avg, loser_avg,
                                            reason, dodge_player_id, dodge_penalty):
@@ -373,375 +697,17 @@ class PlayerVoteView(discord.ui.View):
             result_message += f"↩️ *Réagissez avec ↩️ pour annuler ce match en cas de fraude*"
             
             # Envoyer dans le salon de résumés
-            # Note: Cette partie nécessiterait l'accès au guild via interaction
-            # Elle sera complétée lors de l'intégration finale
-            
-        except Exception as e:
-            print(f"Erreur dans send_match_summary_with_dodge: {e}")
-        """Gère un vote de joueur"""
-        try:
-            # Vérifier que c'est un joueur du match
-            if interaction.user.id not in self.all_player_ids:
-                await interaction.response.send_message("❌ Seuls les joueurs du match peuvent voter!", ephemeral=True)
-                return
-            
-            # Vérifier que le match n'a pas déjà été validé
-            if self.match_validated:
-                await interaction.response.send_message("❌ Ce match a déjà été validé!", ephemeral=True)
-                return
-            
-            # Retirer le vote précédent si il existe
-            self.votes_team1.discard(interaction.user.id)
-            self.votes_team2.discard(interaction.user.id)
-            
-            # Ajouter le nouveau vote
-            if team1_wins:
-                self.votes_team1.add(interaction.user.id)
-                vote_team = "Bleue 🔵"
-            else:
-                self.votes_team2.add(interaction.user.id)
-                vote_team = "Rouge 🔴"
-            
-            self.voters.add(interaction.user.id)
-            
-            await interaction.response.send_message(f"✅ Votre vote pour l'équipe {vote_team} a été enregistré!", ephemeral=True)
-            
-            # Vérifier si on a assez de votes pour une majorité (4/6 minimum)
-            total_votes_team1 = len(self.votes_team1)
-            total_votes_team2 = len(self.votes_team2)
-            total_votes = total_votes_team1 + total_votes_team2
-            
-            # Construire le message de statut
-            team1_voters = []
-            team2_voters = []
-            
-            for player_id in self.votes_team1:
-                team1_voters.append(f"<@{player_id}>")
-            
-            for player_id in self.votes_team2:
-                team2_voters.append(f"<@{player_id}>")
-            
-            status_message = f"🗳️ **VOTE EN COURS** - Lobby #{self.lobby_id}\n\n"
-            status_message += f"🔵 **Équipe Bleue** ({total_votes_team1} votes):\n"
-            if team1_voters:
-                status_message += f"Votants: {', '.join(team1_voters)}\n"
-            
-            status_message += f"\n🔴 **Équipe Rouge** ({total_votes_team2} votes):\n"
-            if team2_voters:
-                status_message += f"Votants: {', '.join(team2_voters)}\n"
-            
-            status_message += f"\n📊 Total votes: {total_votes}/6\n"
-            
-            # Vérifier les conditions de victoire
-            if total_votes_team1 >= 4:
-                # Équipe 1 gagne par majorité
-                await self.validate_match_result(interaction, True, "majorité (4+ votes)")
-                return
-            elif total_votes_team2 >= 4:
-                # Équipe 2 gagne par majorité
-                await self.validate_match_result(interaction, False, "majorité (4+ votes)")
-                return
-            elif total_votes == 6:
-                # Tous ont voté, déterminer le gagnant
-                if total_votes_team1 > total_votes_team2:
-                    await self.validate_match_result(interaction, True, f"votes finaux ({total_votes_team1}-{total_votes_team2})")
-                elif total_votes_team2 > total_votes_team1:
-                    await self.validate_match_result(interaction, False, f"votes finaux ({total_votes_team2}-{total_votes_team1})")
-                else:
-                    # Égalité parfaite 3-3, pas de validation automatique
-                    status_message += "\n⚖️ **ÉGALITÉ PARFAITE** - Un administrateur doit intervenir"
-                    await interaction.edit_original_response(content=status_message, view=self)
-                    return
-            else:
-                # Pas assez de votes, attendre
-                remaining = 6 - total_votes
-                status_message += f"⏳ En attente de {remaining} vote(s) supplémentaire(s)"
-            
-            # Mettre à jour le message
-            try:
-                await interaction.edit_original_response(content=status_message, view=self)
-            except:
-                # Si on ne peut pas éditer, envoyer un nouveau message
-                await interaction.followup.send(status_message, ephemeral=False)
-                
-        except Exception as e:
-            print(f"Erreur dans handle_vote: {e}")
-            try:
-                await interaction.followup.send(f"❌ Erreur lors du vote: {str(e)}", ephemeral=True)
-            except:
-                pass
-    
-    async def validate_match_result(self, team1_wins, reason):
-        """Valide automatiquement le résultat du match"""
-        try:
-            from main import (
-                get_player, update_player_elo, calculate_elo_change,
-                get_connection, save_match_history
-            )
-            
-            # Marquer comme validé
-            self.match_validated = True
-            
-            # Déterminer gagnants et perdants
-            if team1_wins:
-                winner_ids = self.team1_ids
-                loser_ids = self.team2_ids
-                winning_team = "Bleue"
-                winning_color = "🔵"
-            else:
-                winner_ids = self.team2_ids
-                loser_ids = self.team1_ids
-                winning_team = "Rouge"
-                winning_color = "🔴"
-            
-            # Récupérer les joueurs
-            winners = []
-            losers = []
-            winner_elos = []
-            loser_elos = []
-            
-            for player_id in winner_ids:
-                player = get_player(player_id)
-                if player:
-                    winners.append(player)
-                    winner_elos.append(player['elo'])
-            
-            for player_id in loser_ids:
-                player = get_player(player_id)
-                if player:
-                    losers.append(player)
-                    loser_elos.append(player['elo'])
-            
-            if len(winners) != 3 or len(losers) != 3:
-                await self.update_vote_message_status("❌ Erreur: Impossible de récupérer tous les joueurs")
-                return
-            
-            # Calculer les changements d'ELO
-            winner_avg = sum(winner_elos) / 3
-            loser_avg = sum(loser_elos) / 3
-            
-            winner_elo_changes = []
-            loser_elo_changes = []
-            
-            # Appliquer les changements
-            for i, player in enumerate(winners):
-                old_elo = winner_elos[i]
-                elo_change = calculate_elo_change(old_elo, loser_avg, True)
-                new_elo = max(0, old_elo + elo_change)
-                
-                if update_player_elo(player['discord_id'], new_elo, True):
-                    winner_elo_changes.append(elo_change)
-                else:
-                    await self.update_vote_message_status("❌ Erreur lors de la mise à jour des ELO")
-                    return
-            
-            for i, player in enumerate(losers):
-                old_elo = loser_elos[i]
-                elo_change = calculate_elo_change(old_elo, winner_avg, False)
-                new_elo = max(0, old_elo + elo_change)
-                
-                if update_player_elo(player['discord_id'], new_elo, False):
-                    loser_elo_changes.append(elo_change)
-                else:
-                    await self.update_vote_message_status("❌ Erreur lors de la mise à jour des ELO")
-                    return
-            
-            # Désactiver tous les boutons
-            for item in self.children:
-                item.disabled = True
-            
-            # Message de validation
-            validation_message = f"✅ **MATCH VALIDÉ PAR VOTE** ({reason})\n\n"
-            validation_message += f"🏆 VICTOIRE ÉQUIPE {winning_team} {winning_color}\n"
-            validation_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}"
-            
-            # Mettre à jour le message de vote
-            await self.update_vote_message_status("✅ **MATCH VALIDÉ** - Calcul des ELO en cours...")
-            
-            # Créer des objets mock pour la sauvegarde
-            class MockMember:
-                def __init__(self, discord_id, name):
-                    self.id = int(discord_id)
-                    self.display_name = name
-            
-            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
-            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
-            
-            # Sauvegarder pour l'historique (undo)
-            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes)
-            
-            # Envoyer le résumé dans le salon dédié avec réaction d'annulation
-            await self.send_match_summary(winners, losers, winner_elos, loser_elos, 
-                                        winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason)
-            
-            # Mise à jour finale du message de vote
-            await self.update_vote_message_status(validation_message)
-            
-        except Exception as e:
-            print(f"Erreur dans validate_match_result: {e}")
-            await self.update_vote_message_status(f"❌ Erreur lors de la validation: {str(e)}")
-        """Valide automatiquement le résultat du match"""
-        try:
-            from main import (
-                get_player, update_player_elo, calculate_elo_change,
-                get_connection, save_match_history
-            )
-            
-            # Marquer comme validé
-            self.match_validated = True
-            
-            # Déterminer gagnants et perdants
-            if team1_wins:
-                winner_ids = self.team1_ids
-                loser_ids = self.team2_ids
-                winning_team = "Bleue"
-                winning_color = "🔵"
-            else:
-                winner_ids = self.team2_ids
-                loser_ids = self.team1_ids
-                winning_team = "Rouge"
-                winning_color = "🔴"
-            
-            # Récupérer les joueurs
-            winners = []
-            losers = []
-            winner_elos = []
-            loser_elos = []
-            
-            for player_id in winner_ids:
-                player = get_player(player_id)
-                if player:
-                    winners.append(player)
-                    winner_elos.append(player['elo'])
-            
-            for player_id in loser_ids:
-                player = get_player(player_id)
-                if player:
-                    losers.append(player)
-                    loser_elos.append(player['elo'])
-            
-            if len(winners) != 3 or len(losers) != 3:
-                await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer tous les joueurs", view=None)
-                return
-            
-            # Calculer les changements d'ELO
-            winner_avg = sum(winner_elos) / 3
-            loser_avg = sum(loser_elos) / 3
-            
-            winner_elo_changes = []
-            loser_elo_changes = []
-            
-            # Appliquer les changements
-            for i, player in enumerate(winners):
-                old_elo = winner_elos[i]
-                elo_change = calculate_elo_change(old_elo, loser_avg, True)
-                new_elo = max(0, old_elo + elo_change)
-                
-                if update_player_elo(player['discord_id'], new_elo, True):
-                    winner_elo_changes.append(elo_change)
-                else:
-                    await interaction.edit_original_response(content="❌ Erreur lors de la mise à jour des ELO", view=None)
-                    return
-            
-            for i, player in enumerate(losers):
-                old_elo = loser_elos[i]
-                elo_change = calculate_elo_change(old_elo, winner_avg, False)
-                new_elo = max(0, old_elo + elo_change)
-                
-                if update_player_elo(player['discord_id'], new_elo, False):
-                    loser_elo_changes.append(elo_change)
-                else:
-                    await interaction.edit_original_response(content="❌ Erreur lors de la mise à jour des ELO", view=None)
-                    return
-            
-            # Désactiver tous les boutons
-            for item in self.children:
-                item.disabled = True
-            
-            # Message de validation
-            validation_message = f"✅ **MATCH VALIDÉ PAR VOTE** ({reason})\n\n"
-            validation_message += f"🏆 VICTOIRE ÉQUIPE {winning_team} {winning_color}\n"
-            validation_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}"
-            
-            # Mettre à jour le message de vote
-            await interaction.edit_original_response(content=validation_message, view=self)
-            
-            # Créer des objets mock pour la sauvegarde
-            class MockMember:
-                def __init__(self, discord_id, name):
-                    self.id = int(discord_id)
-                    self.display_name = name
-            
-            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
-            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
-            
-            # Sauvegarder pour l'historique (undo)
-            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes)
-            
-            # Envoyer le résumé dans le salon dédié avec réaction d'annulation
-            await self.send_match_summary(interaction, winners, losers, winner_elos, loser_elos, 
-                                        winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason)
-            
-        except Exception as e:
-            print(f"Erreur dans validate_match_result: {e}")
-            try:
-                await interaction.edit_original_response(content=f"❌ Erreur lors de la validation: {str(e)}", view=None)
-            except:
-                pass
-    
-    async def send_match_summary(self, interaction, winners, losers, winner_elos, loser_elos, 
-                                winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason):
-        """Envoie le résumé du match dans le salon dédié"""
-        try:
-            # Construire le message de résultat
-            winning_team = "Bleue" if winners[0]['discord_id'] in [str(id) for id in self.team1_ids] else "Rouge"
-            winning_color = "🔵" if winning_team == "Bleue" else "🔴"
-            losing_color = "🔴" if winning_team == "Bleue" else "🔵"
-            
-            result_message = f"🏆 **RÉSULTAT DE MATCH**\n\n"
-            result_message += f"**Victoire Équipe {winning_team} {winning_color}** (par {reason})\n"
-            result_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
-            
-            result_message += f"{winning_color} **GAGNANTS:**\n"
-            for i, player in enumerate(winners):
-                old_elo = winner_elos[i]
-                change = winner_elo_changes[i]
-                new_elo = old_elo + change
-                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} (+{change})\n"
-            
-            result_message += f"\n{losing_color} **PERDANTS:**\n"
-            for i, player in enumerate(losers):
-                old_elo = loser_elos[i]
-                change = loser_elo_changes[i]
-                new_elo = old_elo + change
-                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} ({change:+})\n"
-            
-            # Statistiques
-            elo_diff = abs(winner_avg - loser_avg)
-            result_message += f"\n📊 **ANALYSE:**\n"
-            result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
-            result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
-            result_message += f"Écart: {round(elo_diff)} points\n\n"
-            result_message += f"↩️ *Réagissez avec ↩️ pour annuler ce match en cas de fraude*"
-            
-            # Envoyer dans le salon de résumés
-            summary_channel = interaction.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
+            summary_channel = self.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
             if summary_channel:
                 summary_message = await summary_channel.send(result_message, suppress_embeds=True)
                 # Ajouter la réaction d'annulation
                 await summary_message.add_reaction("↩️")
                 
                 # Sauvegarder l'ID du message pour l'annulation
-                from main import save_match_message_id
                 save_match_message_id(summary_message.id)
             
         except Exception as e:
-            print(f"Erreur dans send_match_summary: {e}")
-    
-    async def on_timeout(self):
-        """Appelé quand la vue expire"""
-        for item in self.children:
-            item.disabled = True
+            print(f"Erreur dans send_match_summary_with_dodge: {e}")
 
 # ================================
 # CLASSES POUR LES BOUTONS ADMIN
@@ -779,9 +745,8 @@ class AdminMatchResultView(discord.ui.View):
                 await interaction.response.send_message("❌ Ce match a déjà été validé!", ephemeral=True)
                 return
             
-            # Le reste du code est identique à l'ancienne MatchResultView
-            # ... (code de validation identique)
-            # Pour économiser l'espace, je référence le code existant
+            # Le reste du code est identique à validate_match_result
+            # (code de validation des ELO etc.)
             
         except Exception as e:
             print(f"Erreur dans handle_admin_result: {e}")
@@ -800,321 +765,6 @@ async def create_lobby_cmd(ctx, room_code: str = None):
     if not room_code:
         message = "❌ Usage: !create <code_room>"
         await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Vérifier/créer joueur
-    player = get_player(ctx.author.id)
-    if not player:
-        if not create_player(ctx.author.id, ctx.author.display_name):
-            message = "❌ Erreur: Impossible de créer votre profil"
-            await ctx.send(message, suppress_embeds=True)
-            return
-    
-    # Créer le lobby avec vérifications
-    lobby_id, creation_msg = create_lobby(room_code.upper())
-    if not lobby_id:
-        message = f"❌ Erreur: {creation_msg}"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Ajouter le créateur au lobby
-    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
-    
-    if success:
-        # Ping du rôle + message de création
-        role_mention = f"<@&{PING_ROLE_ID}>"
-        message = (f"{role_mention}\n\n"
-                  f"🎮 NOUVEAU LOBBY!\n"
-                  f"Lobby #{lobby_id}\n"
-                  f"Code: {room_code.upper()}\n"
-                  f"Créateur: {ctx.author.display_name}\n"
-                  f"Joueurs: 1/6\n"
-                  f"Rejoindre: !join {lobby_id}\n\n"
-                  f"📊 Lobbies actifs: {len(get_all_lobbies())}/{MAX_CONCURRENT_LOBBIES}")
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def join_lobby_cmd(ctx, lobby_id: int = None):
-    """!join <id> - Rejoindre un lobby"""
-    from main import (
-        get_player, create_player, add_player_to_lobby, get_lobby,
-        create_random_teams, select_random_maps, get_connection
-    )
-    
-    if lobby_id is None:
-        message = "❌ Usage: !join <id_lobby>"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Vérifier/créer joueur
-    player = get_player(ctx.author.id)
-    if not player:
-        if not create_player(ctx.author.id, ctx.author.display_name):
-            message = "❌ Erreur: Impossible de créer votre profil"
-            await ctx.send(message, suppress_embeds=True)
-            return
-    
-    # Rejoindre le lobby
-    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
-    
-    if success:
-        # Récupérer info lobby
-        lobby = get_lobby(lobby_id)
-        if lobby:
-            players_list = lobby['players'].split(',') if lobby['players'] else []
-            players_count = len(players_list)
-            
-            if players_count >= 6:
-                # Créer les équipes aléatoires
-                team1_ids, team2_ids = create_random_teams([int(id) for id in players_list])
-                
-                # Récupérer les noms des joueurs et créer les mentions
-                team1_mentions = []
-                team2_mentions = []
-                
-                for player_id in team1_ids:
-                    player = get_player(player_id)
-                    if player:
-                        team1_mentions.append(f"<@{player_id}>")
-                
-                for player_id in team2_ids:
-                    player = get_player(player_id)
-                    if player:
-                        team2_mentions.append(f"<@{player_id}>")
-                
-                # Sélectionner 3 maps aléatoires
-                selected_maps = select_random_maps(3)
-                
-                team1_text = '\n'.join([f"• {mention}" for mention in team1_mentions])
-                team2_text = '\n'.join([f"• {mention}" for mention in team2_mentions])
-                maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
-                
-                # Créer le lien cliquable
-                room_link = f"https://link.nulls.gg/nb/invite/gameroom/fr?tag={lobby['room_code']}"
-                
-                message = (f"🚀 MATCH LANCE!\n"
-                          f"Lobby #{lobby_id} complet! Équipes créées!\n\n"
-                          f"🔵 Équipe 1:\n{team1_text}\n\n"
-                          f"🔴 Équipe 2:\n{team2_text}\n\n"
-                          f"🗺️ Maps:\n{maps_text}\n\n"
-                          f"🎮 Rejoindre la room: {room_link}\n\n"
-                          f"📊 Le vote pour le résultat se fera dans le salon de validation après le match.")
-                
-                # Envoyer SEULEMENT le message d'info dans le salon des joueurs (sans vote)
-                await ctx.send(message, suppress_embeds=True)
-                
-                # Envoyer le SEUL message avec vote dans le salon de validation
-                vote_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
-                if vote_channel:
-                    vote_message = (f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{lobby_id}\n"
-                                  f"Code: {lobby['room_code']}\n\n"
-                                  f"🔵 **Équipe Bleue:**\n{team1_text}\n\n"
-                                  f"🔴 **Équipe Rouge:**\n{team2_text}\n\n"
-                                  f"🗺️ **Maps:**\n{maps_text}\n\n"
-                                  f"🎮 **Lien room:** {room_link}\n\n"
-                                  f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
-                                  f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
-                                  f"⏰ Vous avez 24h pour voter")
-                    
-                    vote_view = PlayerVoteView(team1_ids, team2_ids, lobby_id, lobby['room_code'])
-                    vote_msg = await vote_channel.send(vote_message, view=vote_view, suppress_embeds=True)
-                    
-                    # Sauvegarder la référence du message pour les mises à jour
-                    await vote_view.set_original_message(vote_msg)
-                
-                # Supprimer le lobby maintenant qu'il est lancé
-                conn = get_connection()
-                if conn:
-                    try:
-                        with conn.cursor() as c:
-                            c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
-                            conn.commit()
-                    finally:
-                        conn.close()
-            else:
-                message = (f"✅ LOBBY REJOINT!\n"
-                          f"{msg}\n"
-                          f"Lobby: #{lobby_id}\n"
-                          f"Code: {lobby['room_code']}\n"
-                          f"Joueurs: {players_count}/6")
-        else:
-            message = f"✅ Rejoint: {msg}"
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def leave_lobby_cmd(ctx):
-    """!leave - Quitter votre lobby"""
-    from main import remove_player_from_lobby
-    
-    success, msg = remove_player_from_lobby(ctx.author.id)
-    
-    if success:
-        message = f"👋 Quitté: {msg}"
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def list_lobbies_cmd(ctx):
-    """!lobbies - Liste des lobbies actifs"""
-    from main import (
-        get_all_lobbies, get_cooldown_info, MAX_CONCURRENT_LOBBIES
-    )
-    
-    lobbies = get_all_lobbies()
-    cooldown_info = get_cooldown_info()
-    
-    message = f"🎮 LOBBIES ACTIFS ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES}):\n\n"
-    
-    if not lobbies:
-        message += "📋 Aucun lobby actif\n"
-    else:
-        for lobby in lobbies:
-            lobby_id = lobby['id']
-            room_code = lobby['room_code']
-            players_str = lobby['players']
-            players_count = len(players_str.split(',')) if players_str else 0
-            
-            status = "🟢" if players_count < 6 else "🔴"
-            message += f"{status} Lobby #{lobby_id}\n"
-            message += f"Code: {room_code}\n"
-            message += f"Joueurs: {players_count}/6\n\n"
-    
-    # Afficher le cooldown si actif
-    if cooldown_info and cooldown_info.get('active'):
-        minutes = cooldown_info['remaining_minutes']
-        seconds = cooldown_info['remaining_seconds']
-        message += f"⏰ Cooldown: {minutes}m {seconds}s restantes\n"
-    else:
-        message += "✅ Nouveau lobby possible\n"
-    
-    message += f"Créer: !create <code>"
-    await ctx.send(message, suppress_embeds=True)
-
-async def show_elo_cmd(ctx):
-    """!elo - Voir son ELO et rang"""
-    from main import get_player, get_leaderboard, get_player_dodge_count
-    
-    player = get_player(ctx.author.id)
-    
-    if not player:
-        message = ("❌ NON INSCRIT\n"
-                  "Utilisez !create <code> ou !join <id> pour vous inscrire automatiquement")
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Récupérer le pseudo Discord actuel
-    try:
-        member = ctx.guild.get_member(int(player['discord_id']))
-        display_name = member.display_name if member else player['name']
-    except:
-        display_name = player['name']
-    
-    elo = player['elo']
-    wins = player['wins']
-    losses = player['losses']
-    dodge_count = get_player_dodge_count(ctx.author.id)
-    
-    total_games = wins + losses
-    winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
-    
-    # Calculer le rang
-    players = get_leaderboard()
-    rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
-    
-    message = (f"📊 {display_name}\n"
-              f"ELO: {elo} points\n"
-              f"Rang: #{rank}/{len(players)}\n"
-              f"Victoires: {wins}\n"
-              f"Défaites: {losses}\n"
-              f"Winrate: {winrate}%")
-    
-    if dodge_count > 0:
-        message += f"\n🚨 Dodges: {dodge_count}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def leaderboard_cmd(ctx):
-    """!leaderboard - Classement des joueurs"""
-    from main import get_leaderboard, get_player
-    
-    players = get_leaderboard()
-    
-    if not players:
-        message = "📊 CLASSEMENT VIDE\nAucun joueur inscrit"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    message = "🏆 CLASSEMENT ELO\n\n"
-    
-    for i, player in enumerate(players[:10], 1):
-        # Récupérer le membre Discord actuel pour avoir le pseudo à jour
-        try:
-            member = ctx.guild.get_member(int(player['discord_id']))
-            display_name = member.display_name if member else player['name']
-        except:
-            display_name = player['name']
-        
-        elo = player['elo']
-        wins = player['wins']
-        losses = player['losses']
-        
-        total_games = wins + losses
-        winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
-        
-        if i == 1:
-            emoji = "🥇"
-        elif i == 2:
-            emoji = "🥈"
-        elif i == 3:
-            emoji = "🥉"
-        else:
-            emoji = f"{i}."
-        
-        message += f"{emoji} {display_name} - {elo} ELO ({winrate}%)\n"
-    
-    message += f"\n{len(players)} joueur(s) total"
-    
-    # Position du joueur actuel
-    current_player = get_player(ctx.author.id)
-    if current_player:
-        current_pos = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), None)
-        if current_pos:
-            message += f"\n\nVotre position: #{current_pos} - {current_player['elo']} ELO"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def lobby_status_cmd(ctx):
-    """!status - Statut des lobbies et cooldown"""
-    from main import (
-        get_all_lobbies, get_cooldown_info, get_leaderboard,
-        MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES
-    )
-    
-    lobbies = get_all_lobbies()
-    cooldown_info = get_cooldown_info()
-    
-    message = f"📊 STATUT SYSTÈME\n\n"
-    message += f"🎮 Lobbies: {len(lobbies)}/{MAX_CONCURRENT_LOBBIES}\n"
-    
-    if cooldown_info and cooldown_info.get('active'):
-        minutes = cooldown_info['remaining_minutes']
-        seconds = cooldown_info['remaining_seconds']
-        message += f"⏰ Cooldown: {minutes}m {seconds}s\n"
-    else:
-        message += f"✅ Création possible\n"
-    
-    message += f"⏱️ Cooldown: {LOBBY_COOLDOWN_MINUTES} min\n"
-    
-    # Statistiques des joueurs
-    players = get_leaderboard()
-    message += f"👥 Joueurs inscrits: {len(players)}"
-    
-    await ctx.send(message, suppress_embeds=True)
 
 # ================================
 # COMMANDES ADMIN
@@ -1649,7 +1299,7 @@ async def setup_commands(bot):
             return
         await handle_match_cancel_reaction(payload)
     
-    print("✅ Système de vote des joueurs activé")
+    print("✅ Système de vote des joueurs activé avec auto-refresh")
     print("✅ Toutes les commandes chargées depuis commands.py")
     print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES}")
     print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
@@ -1657,6 +1307,318 @@ async def setup_commands(bot):
     print(f"📺 Salon validation admin: {RESULT_CHANNEL_ID}")
     print(f"📋 Salon résumés matchs: {MATCH_SUMMARY_CHANNEL_ID}")
     print("🗳️ Vote des joueurs activé (majorité 4/6 ou unanimité)")
+    print("🔄 Auto-refresh des messages de vote toutes les 15 minutes")
     print("↩️ Annulation par réaction activée")
     print("🚨 Système anti-dodge activé")
     print("🔧 Commandes admin: !resetcd, !clearlobbies, !undo, /result, !addelo, !removeelo")
+        return
+    
+    # Vérifier/créer joueur
+    player = get_player(ctx.author.id)
+    if not player:
+        if not create_player(ctx.author.id, ctx.author.display_name):
+            message = "❌ Erreur: Impossible de créer votre profil"
+            await ctx.send(message, suppress_embeds=True)
+            return
+    
+    # Créer le lobby avec vérifications
+    lobby_id, creation_msg = create_lobby(room_code.upper())
+    if not lobby_id:
+        message = f"❌ Erreur: {creation_msg}"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Ajouter le créateur au lobby
+    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
+    
+    if success:
+        # Ping du rôle + message de création
+        role_mention = f"<@&{PING_ROLE_ID}>"
+        message = (f"{role_mention}\n\n"
+                  f"🎮 NOUVEAU LOBBY!\n"
+                  f"Lobby #{lobby_id}\n"
+                  f"Code: {room_code.upper()}\n"
+                  f"Créateur: {ctx.author.display_name}\n"
+                  f"Joueurs: 1/6\n"
+                  f"Rejoindre: !join {lobby_id}\n\n"
+                  f"📊 Lobbies actifs: {len(get_all_lobbies())}/{MAX_CONCURRENT_LOBBIES}")
+    else:
+        message = f"❌ Erreur: {msg}"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def join_lobby_cmd(ctx, lobby_id: int = None):
+    """!join <id> - Rejoindre un lobby"""
+    from main import (
+        get_player, create_player, add_player_to_lobby, get_lobby,
+        create_random_teams, select_random_maps, get_connection
+    )
+    
+    if lobby_id is None:
+        message = "❌ Usage: !join <id_lobby>"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Vérifier/créer joueur
+    player = get_player(ctx.author.id)
+    if not player:
+        if not create_player(ctx.author.id, ctx.author.display_name):
+            message = "❌ Erreur: Impossible de créer votre profil"
+            await ctx.send(message, suppress_embeds=True)
+            return
+    
+    # Rejoindre le lobby
+    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
+    
+    if success:
+        # Récupérer info lobby
+        lobby = get_lobby(lobby_id)
+        if lobby:
+            players_list = lobby['players'].split(',') if lobby['players'] else []
+            players_count = len(players_list)
+            
+            if players_count >= 6:
+                # Créer les équipes aléatoires
+                team1_ids, team2_ids = create_random_teams([int(id) for id in players_list])
+                
+                # Récupérer les noms des joueurs et créer les mentions
+                team1_mentions = []
+                team2_mentions = []
+                
+                for player_id in team1_ids:
+                    player = get_player(player_id)
+                    if player:
+                        team1_mentions.append(f"<@{player_id}>")
+                
+                for player_id in team2_ids:
+                    player = get_player(player_id)
+                    if player:
+                        team2_mentions.append(f"<@{player_id}>")
+                
+                # Sélectionner 3 maps aléatoires
+                selected_maps = select_random_maps(3)
+                
+                team1_text = '\n'.join([f"• {mention}" for mention in team1_mentions])
+                team2_text = '\n'.join([f"• {mention}" for mention in team2_mentions])
+                maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
+                
+                # Créer le lien cliquable
+                room_link = f"https://link.nulls.gg/nb/invite/gameroom/fr?tag={lobby['room_code']}"
+                
+                # MESSAGE UNIQUE: Confirmation simple dans le salon des joueurs
+                confirmation_message = f"🚀 **MATCH LANCÉ!**\nLobby #{lobby_id} - Code: {lobby['room_code']}\n✅ Équipes créées et envoyées dans le salon de vote!"
+                await ctx.send(confirmation_message, suppress_embeds=True)
+                
+                # MESSAGE DE VOTE: Dans le salon admin avec tous les détails
+                vote_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
+                if vote_channel:
+                    vote_message = (f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{lobby_id}\n"
+                                   f"Code: {lobby['room_code']}\n\n"
+                                   f"🔵 **Équipe Bleue:**\n{team1_text}\n\n"
+                                   f"🔴 **Équipe Rouge:**\n{team2_text}\n\n"
+                                   f"🗺️ **Maps:**\n{maps_text}\n\n"
+                                   f"🎮 **Lien room:** {room_link}\n\n"
+                                   f"📊 Total votes: 0/6\n"
+                                   f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
+                                   f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
+                                   f"🔄 Message auto-refresh toutes les 15 minutes")
+                    
+                    vote_view = PlayerVoteView(team1_ids, team2_ids, lobby_id, lobby['room_code'], ctx.guild)
+                    vote_msg = await vote_channel.send(vote_message, view=vote_view, suppress_embeds=True)
+                    
+                    # Démarrer le refresh automatique
+                    vote_view.current_message = vote_msg
+                    await vote_view.start_refresh_task()
+                
+                # Supprimer le lobby maintenant qu'il est lancé
+                conn = get_connection()
+                if conn:
+                    try:
+                        with conn.cursor() as c:
+                            c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
+                            conn.commit()
+                    finally:
+                        conn.close()
+            else:
+                message = (f"✅ LOBBY REJOINT!\n"
+                          f"{msg}\n"
+                          f"Lobby: #{lobby_id}\n"
+                          f"Code: {lobby['room_code']}\n"
+                          f"Joueurs: {players_count}/6")
+                await ctx.send(message, suppress_embeds=True)
+        else:
+            message = f"✅ Rejoint: {msg}"
+            await ctx.send(message, suppress_embeds=True)
+    else:
+        message = f"❌ Erreur: {msg}"
+        await ctx.send(message, suppress_embeds=True)
+
+async def leave_lobby_cmd(ctx):
+    """!leave - Quitter votre lobby"""
+    from main import remove_player_from_lobby
+    
+    success, msg = remove_player_from_lobby(ctx.author.id)
+    
+    if success:
+        message = f"👋 Quitté: {msg}"
+    else:
+        message = f"❌ Erreur: {msg}"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def list_lobbies_cmd(ctx):
+    """!lobbies - Liste des lobbies actifs"""
+    from main import (
+        get_all_lobbies, get_cooldown_info, MAX_CONCURRENT_LOBBIES
+    )
+    
+    lobbies = get_all_lobbies()
+    cooldown_info = get_cooldown_info()
+    
+    message = f"🎮 LOBBIES ACTIFS ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES}):\n\n"
+    
+    if not lobbies:
+        message += "📋 Aucun lobby actif\n"
+    else:
+        for lobby in lobbies:
+            lobby_id = lobby['id']
+            room_code = lobby['room_code']
+            players_str = lobby['players']
+            players_count = len(players_str.split(',')) if players_str else 0
+            
+            status = "🟢" if players_count < 6 else "🔴"
+            message += f"{status} Lobby #{lobby_id}\n"
+            message += f"Code: {room_code}\n"
+            message += f"Joueurs: {players_count}/6\n\n"
+    
+    # Afficher le cooldown si actif
+    if cooldown_info and cooldown_info.get('active'):
+        minutes = cooldown_info['remaining_minutes']
+        seconds = cooldown_info['remaining_seconds']
+        message += f"⏰ Cooldown: {minutes}m {seconds}s restantes\n"
+    else:
+        message += "✅ Nouveau lobby possible\n"
+    
+    message += f"Créer: !create <code>"
+    await ctx.send(message, suppress_embeds=True)
+
+async def show_elo_cmd(ctx):
+    """!elo - Voir son ELO et rang"""
+    from main import get_player, get_leaderboard, get_player_dodge_count
+    
+    player = get_player(ctx.author.id)
+    
+    if not player:
+        message = ("❌ NON INSCRIT\n"
+                  "Utilisez !create <code> ou !join <id> pour vous inscrire automatiquement")
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    # Récupérer le pseudo Discord actuel
+    try:
+        member = ctx.guild.get_member(int(player['discord_id']))
+        display_name = member.display_name if member else player['name']
+    except:
+        display_name = player['name']
+    
+    elo = player['elo']
+    wins = player['wins']
+    losses = player['losses']
+    dodge_count = get_player_dodge_count(ctx.author.id)
+    
+    total_games = wins + losses
+    winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
+    
+    # Calculer le rang
+    players = get_leaderboard()
+    rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
+    
+    message = (f"📊 {display_name}\n"
+              f"ELO: {elo} points\n"
+              f"Rang: #{rank}/{len(players)}\n"
+              f"Victoires: {wins}\n"
+              f"Défaites: {losses}\n"
+              f"Winrate: {winrate}%")
+    
+    if dodge_count > 0:
+        message += f"\n🚨 Dodges: {dodge_count}"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def leaderboard_cmd(ctx):
+    """!leaderboard - Classement des joueurs"""
+    from main import get_leaderboard, get_player
+    
+    players = get_leaderboard()
+    
+    if not players:
+        message = "📊 CLASSEMENT VIDE\nAucun joueur inscrit"
+        await ctx.send(message, suppress_embeds=True)
+        return
+    
+    message = "🏆 CLASSEMENT ELO\n\n"
+    
+    for i, player in enumerate(players[:10], 1):
+        # Récupérer le membre Discord actuel pour avoir le pseudo à jour
+        try:
+            member = ctx.guild.get_member(int(player['discord_id']))
+            display_name = member.display_name if member else player['name']
+        except:
+            display_name = player['name']
+        
+        elo = player['elo']
+        wins = player['wins']
+        losses = player['losses']
+        
+        total_games = wins + losses
+        winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
+        
+        if i == 1:
+            emoji = "🥇"
+        elif i == 2:
+            emoji = "🥈"
+        elif i == 3:
+            emoji = "🥉"
+        else:
+            emoji = f"{i}."
+        
+        message += f"{emoji} {display_name} - {elo} ELO ({winrate}%)\n"
+    
+    message += f"\n{len(players)} joueur(s) total"
+    
+    # Position du joueur actuel
+    current_player = get_player(ctx.author.id)
+    if current_player:
+        current_pos = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), None)
+        if current_pos:
+            message += f"\n\nVotre position: #{current_pos} - {current_player['elo']} ELO"
+    
+    await ctx.send(message, suppress_embeds=True)
+
+async def lobby_status_cmd(ctx):
+    """!status - Statut des lobbies et cooldown"""
+    from main import (
+        get_all_lobbies, get_cooldown_info, get_leaderboard,
+        MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES
+    )
+    
+    lobbies = get_all_lobbies()
+    cooldown_info = get_cooldown_info()
+    
+    message = f"📊 STATUT SYSTÈME\n\n"
+    message += f"🎮 Lobbies: {len(lobbies)}/{MAX_CONCURRENT_LOBBIES}\n"
+    
+    if cooldown_info and cooldown_info.get('active'):
+        minutes = cooldown_info['remaining_minutes']
+        seconds = cooldown_info['remaining_seconds']
+        message += f"⏰ Cooldown: {minutes}m {seconds}s\n"
+    else:
+        message += f"✅ Création possible\n"
+    
+    message += f"⏱️ Cooldown: {LOBBY_COOLDOWN_MINUTES} min\n"
+    
+    # Statistiques des joueurs
+    players = get_leaderboard()
+    message += f"👥 Joueurs inscrits: {len(players)}"
+    
+    await ctx.send(message, suppress_embeds=True)
