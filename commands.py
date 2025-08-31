@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Ultra Simplifié - COMMANDES
-Toutes les commandes du bot avec système de vote des joueurs et annulation par réaction
+Version avec attribution automatique du rôle ping
 """
 
 import discord
@@ -12,1143 +12,775 @@ from typing import Optional, Literal
 import asyncio
 import json
 
-# Salon de validation des résultats (admin)
+# Configuration des salons
 RESULT_CHANNEL_ID = 1408595087331430520
-# Salon des résumés de matchs (public avec annulation)
 MATCH_SUMMARY_CHANNEL_ID = 1385919316569886732
 
 # ================================
-# CLASSE POUR SÉLECTION DE DODGE
+# UTILITAIRES RÔLES
 # ================================
 
-class DodgeReportSelect(discord.ui.Select):
-    """Menu de sélection pour signaler un joueur qui a dodge"""
-    
-    def __init__(self, options, vote_view, reporter_id):
-        super().__init__(placeholder="Choisir le joueur qui a dodge...", options=options, min_values=1, max_values=1)
-        self.vote_view = vote_view
-        self.reporter_id = reporter_id
-    
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            reported_player_id = int(self.values[0])
+async def ensure_player_has_ping_role(guild, user_id):
+    """S'assure qu'un joueur a le rôle ping"""
+    try:
+        from main import PING_ROLE_ID
+        
+        member = guild.get_member(user_id)
+        if not member:
+            return False
             
-            # Traiter le signalement
-            await self.vote_view.process_dodge_report(self.reporter_id, reported_player_id)
+        role = guild.get_role(PING_ROLE_ID)
+        if not role:
+            return False
             
-            # Réponse sécurisée
-            await self.vote_view.safe_respond(
-                interaction,
-                f"✅ Signalement enregistré pour <@{reported_player_id}>",
-                ephemeral=True
-            )
+        if role not in member.roles:
+            await member.add_roles(role, reason="Joueur ELO inscrit automatiquement")
+            print(f"✅ Rôle ping attribué à {member.display_name}")
             
-        except Exception as e:
-            print(f"Erreur dans DodgeReportSelect callback: {e}")
-            await self.vote_view.safe_respond(
-                interaction,
-                "❌ Erreur lors du signalement",
-                ephemeral=True
-            )
+        return True
+    except Exception as e:
+        print(f"Erreur ensure_player_has_ping_role: {e}")
+        return False
+
+async def assign_ping_role_to_all_players(guild):
+    """Attribue le rôle ping à tous les joueurs en base"""
+    try:
+        from main import get_leaderboard, PING_ROLE_ID
+        
+        players = get_leaderboard()  # Récupère tous les joueurs
+        role = guild.get_role(PING_ROLE_ID)
+        
+        if not role:
+            print(f"❌ Rôle ping {PING_ROLE_ID} introuvable")
+            return 0
+        
+        assigned_count = 0
+        for player in players:
+            member = guild.get_member(int(player['discord_id']))
+            if member and role not in member.roles:
+                try:
+                    await member.add_roles(role, reason="Attribution automatique rôle ELO")
+                    assigned_count += 1
+                    print(f"✅ Rôle attribué à {member.display_name}")
+                except Exception as e:
+                    print(f"❌ Erreur attribution rôle pour {member.display_name}: {e}")
+        
+        return assigned_count
+    except Exception as e:
+        print(f"Erreur assign_ping_role_to_all_players: {e}")
+        return 0
 
 # ================================
-# CLASSES POUR LES BOUTONS DE VOTE
+# CLASSES DE VOTE SIMPLIFIÉES
 # ================================
 
 class PlayerVoteView(discord.ui.View):
-    """Vue avec boutons pour que les joueurs votent le résultat d'un match"""
+    """Vue simplifiée pour le vote des joueurs avec auto-refresh"""
     
     def __init__(self, team1_ids, team2_ids, lobby_id, room_code, guild):
-        super().__init__(timeout=None)  # Pas de timeout car on gère le refresh manuel
-        self.team1_ids = team1_ids  # Équipe bleue
-        self.team2_ids = team2_ids  # Équipe rouge
-        self.lobby_id = lobby_id
-        self.room_code = room_code
-        self.guild = guild
-        self.votes_team1 = set()  # IDs des joueurs qui ont voté équipe 1
-        self.votes_team2 = set()  # IDs des joueurs qui ont voté équipe 2
-        self.voters = set()  # Tous les joueurs qui ont voté
-        self.match_validated = False
-        self.all_player_ids = set(team1_ids + team2_ids)
-        self.dodge_reports = {}  # {user_id: reported_player_id}
-        self.dodge_confirmed = None  # ID du joueur confirmé comme ayant dodge
-        self.current_message = None  # Référence au message actuel
-        self.refresh_task = None  # Tâche de refresh automatique
-    
-    async def start_refresh_task(self):
-        """Démarre la tâche de refresh automatique toutes les 15 minutes"""
-        self.refresh_task = asyncio.create_task(self._refresh_loop())
-    
-    async def _refresh_loop(self):
-        """Boucle de refresh du message toutes les 15 minutes"""
-        try:
-            while not self.match_validated:
-                await asyncio.sleep(15 * 60)  # 15 minutes
-                if not self.match_validated and self.current_message:
-                    await self._refresh_message()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"Erreur dans _refresh_loop: {e}")
-    
-    async def _refresh_message(self):
-        """Refresh le message en le supprimant et le recréant"""
-        try:
-            if not self.current_message or self.match_validated:
-                return
-            
-            # Construire le message de vote actuel
-            vote_message = await self._build_vote_message()
-            
-            # Récupérer le canal
-            channel = self.guild.get_channel(RESULT_CHANNEL_ID)
-            if not channel:
-                return
-            
-            # Supprimer l'ancien message
-            try:
-                await self.current_message.delete()
-            except:
-                pass  # Message peut-être déjà supprimé
-            
-            # Créer un nouveau message avec une nouvelle vue
-            new_view = PlayerVoteView(self.team1_ids, self.team2_ids, self.lobby_id, self.room_code, self.guild)
-            
-            # Copier l'état actuel
-            new_view.votes_team1 = self.votes_team1.copy()
-            new_view.votes_team2 = self.votes_team2.copy()
-            new_view.voters = self.voters.copy()
-            new_view.dodge_reports = self.dodge_reports.copy()
-            new_view.dodge_confirmed = self.dodge_confirmed
-            new_view.match_validated = self.match_validated
-            
-            # Envoyer le nouveau message
-            new_message = await channel.send(vote_message, view=new_view, suppress_embeds=True)
-            
-            # Mettre à jour les références
-            new_view.current_message = new_message
-            await new_view.start_refresh_task()
-            
-            # Arrêter l'ancien refresh
-            if self.refresh_task:
-                self.refresh_task.cancel()
-            
-        except Exception as e:
-            print(f"Erreur dans _refresh_message: {e}")
-    
-    async def _build_vote_message(self):
-        """Construit le message de vote avec l'état actuel"""
-        from main import select_random_maps
-        
-        # Récupérer les mentions des équipes
-        team1_mentions = [f"<@{pid}>" for pid in self.team1_ids]
-        team2_mentions = [f"<@{pid}>" for pid in self.team2_ids]
-        
-        team1_text = '\n'.join([f"• {mention}" for mention in team1_mentions])
-        team2_text = '\n'.join([f"• {mention}" for mention in team2_mentions])
-        
-        # Maps (pour le refresh, on remet les mêmes maps - idéalement il faudrait les sauvegarder)
-        selected_maps = select_random_maps(3)
-        maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
-        
-        # Lien room
-        room_link = f"https://link.nulls.gg/nb/invite/gameroom/fr?tag={self.room_code}"
-        
-        # Construire le message avec les votes actuels
-        total_votes_team1 = len(self.votes_team1)
-        total_votes_team2 = len(self.votes_team2)
-        total_votes = total_votes_team1 + total_votes_team2
-        
-        vote_message = f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{self.lobby_id}\n"
-        vote_message += f"Code: {self.room_code}\n\n"
-        
-        vote_message += f"🔵 **Équipe Bleue** ({total_votes_team1} votes):\n{team1_text}\n"
-        if self.votes_team1:
-            voters_team1 = [f"<@{pid}>" for pid in self.votes_team1]
-            vote_message += f"Votants: {', '.join(voters_team1)}\n"
-        
-        vote_message += f"\n🔴 **Équipe Rouge** ({total_votes_team2} votes):\n{team2_text}\n"
-        if self.votes_team2:
-            voters_team2 = [f"<@{pid}>" for pid in self.votes_team2]
-            vote_message += f"Votants: {', '.join(voters_team2)}\n"
-        
-        vote_message += f"\n🗺️ **Maps:**\n{maps_text}\n\n"
-        vote_message += f"🎮 **Lien room:** {room_link}\n\n"
-        
-        # Informations sur les signalements de dodge
-        if self.dodge_reports:
-            report_counts = {}
-            for reported_id in self.dodge_reports.values():
-                report_counts[reported_id] = report_counts.get(reported_id, 0) + 1
-            
-            vote_message += f"🚨 **SIGNALEMENTS DE DODGE:**\n"
-            for player_id, count in report_counts.items():
-                vote_message += f"<@{player_id}>: {count} signalement(s)\n"
-            
-            vote_message += f"(Majorité de 3 signalements = dodge confirmé)\n\n"
-        
-        vote_message += f"📊 Total votes: {total_votes}/6\n"
-        
-        if total_votes < 6:
-            remaining = 6 - total_votes
-            vote_message += f"⏳ En attente de {remaining} vote(s) supplémentaire(s)\n\n"
-        
-        vote_message += f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
-        vote_message += f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
-        vote_message += f"🔄 Message auto-refresh toutes les 15 minutes"
-        
-        return vote_message
-    
-    async def safe_respond(self, interaction, content, ephemeral=False, view=None):
-        """Réponse sécurisée qui gère les timeouts"""
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(content, ephemeral=ephemeral, view=view)
-            else:
-                await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
-        except discord.errors.NotFound:
-            # Interaction expirée, ignore
-            pass
-        except Exception as e:
-            print(f"Erreur dans safe_respond: {e}")
-    
-    @discord.ui.button(label='🔵 Victoire Équipe Bleue', style=discord.ButtonStyle.primary, emoji='🔵')
-    async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_vote(interaction, team1_wins=True)
-    
-    @discord.ui.button(label='🔴 Victoire Équipe Rouge', style=discord.ButtonStyle.danger, emoji='🔴')
-    async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_vote(interaction, team1_wins=False)
-    
-    @discord.ui.button(label='🚨 Signaler un Dodge', style=discord.ButtonStyle.secondary, emoji='🚨')
-    async def report_dodge(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_dodge_report(interaction)
-    
-    async def handle_vote(self, interaction: discord.Interaction, team1_wins: bool):
-        """Gère un vote de joueur"""
-        try:
-            # Vérifier que c'est un joueur du match
-            if interaction.user.id not in self.all_player_ids:
-                await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent voter!", ephemeral=True)
-                return
-            
-            # Vérifier que le match n'a pas déjà été validé
-            if self.match_validated:
-                await self.safe_respond(interaction, "❌ Ce match a déjà été validé!", ephemeral=True)
-                return
-            
-            # Retirer le vote précédent si il existe
-            self.votes_team1.discard(interaction.user.id)
-            self.votes_team2.discard(interaction.user.id)
-            
-            # Ajouter le nouveau vote
-            if team1_wins:
-                self.votes_team1.add(interaction.user.id)
-                vote_team = "Bleue 🔵"
-            else:
-                self.votes_team2.add(interaction.user.id)
-                vote_team = "Rouge 🔴"
-            
-            self.voters.add(interaction.user.id)
-            
-            await self.safe_respond(interaction, f"✅ Votre vote pour l'équipe {vote_team} a été enregistré!", ephemeral=True)
-            
-            # Vérifier si on a assez de votes pour une majorité (4/6 minimum)
-            total_votes_team1 = len(self.votes_team1)
-            total_votes_team2 = len(self.votes_team2)
-            total_votes = total_votes_team1 + total_votes_team2
-            
-            # Vérifier les conditions de victoire
-            if total_votes_team1 >= 4:
-                # Équipe 1 gagne par majorité
-                await self.validate_match_result(True, "majorité (4+ votes)")
-                return
-            elif total_votes_team2 >= 4:
-                # Équipe 2 gagne par majorité
-                await self.validate_match_result(False, "majorité (4+ votes)")
-                return
-            elif total_votes == 6:
-                # Tous ont voté, déterminer le gagnant
-                if total_votes_team1 > total_votes_team2:
-                    await self.validate_match_result(True, f"votes finaux ({total_votes_team1}-{total_votes_team2})")
-                elif total_votes_team2 > total_votes_team1:
-                    await self.validate_match_result(False, f"votes finaux ({total_votes_team2}-{total_votes_team1})")
-                else:
-                    # Égalité parfaite 3-3, pas de validation automatique
-                    await self._refresh_message()
-                    return
-            else:
-                # Pas assez de votes, refresh le message avec les nouveaux votes
-                await self._refresh_message()
-                
-        except Exception as e:
-            print(f"Erreur dans handle_vote: {e}")
-            try:
-                await self.safe_respond(interaction, f"❌ Erreur lors du vote: {str(e)}", ephemeral=True)
-            except:
-                pass
-    
-    async def handle_dodge_report(self, interaction: discord.Interaction):
-        """Gère le signalement d'un dodge"""
-        try:
-            # Vérifier que c'est un joueur du match
-            if interaction.user.id not in self.all_player_ids:
-                await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent signaler un dodge!", ephemeral=True)
-                return
-            
-            # Vérifier que le match n'a pas déjà été validé
-            if self.match_validated:
-                await self.safe_respond(interaction, "❌ Ce match a déjà été validé!", ephemeral=True)
-                return
-            
-            # Créer une liste de sélection avec tous les joueurs du match
-            options = []
-            for player_id in self.all_player_ids:
-                if player_id != interaction.user.id:  # Ne pas inclure soi-même
-                    options.append(discord.SelectOption(
-                        label=f"Joueur {player_id}",
-                        value=str(player_id),
-                        description="Signaler ce joueur pour dodge"
-                    ))
-            
-            if not options:
-                await self.safe_respond(interaction, "❌ Aucun autre joueur à signaler", ephemeral=True)
-                return
-            
-            # Créer le menu de sélection
-            select = DodgeReportSelect(options, self, interaction.user.id)
-            view = discord.ui.View(timeout=300)  # 5 minutes pour sélectionner
-            view.add_item(select)
-            
-            await self.safe_respond(interaction, "🚨 Sélectionnez le joueur qui a dodge:", view=view, ephemeral=True)
-            
-        except Exception as e:
-            print(f"Erreur dans handle_dodge_report: {e}")
-    
-    async def process_dodge_report(self, reporter_id, reported_player_id):
-        """Traite un signalement de dodge"""
-        try:
-            # Enregistrer le signalement
-            self.dodge_reports[reporter_id] = int(reported_player_id)
-            
-            # Compter les signalements pour chaque joueur
-            report_counts = {}
-            for reported_id in self.dodge_reports.values():
-                report_counts[reported_id] = report_counts.get(reported_id, 0) + 1
-            
-            # Vérifier si un joueur a assez de signalements (majorité = 3+ signalements)
-            for player_id, count in report_counts.items():
-                if count >= 3:  # Majorité de 3/5 autres joueurs
-                    self.dodge_confirmed = player_id
-                    await self.handle_confirmed_dodge()
-                    return
-            
-            # Pas encore de majorité, refresh le message
-            await self._refresh_message()
-            
-        except Exception as e:
-            print(f"Erreur dans process_dodge_report: {e}")
-    
-    async def handle_confirmed_dodge(self):
-        """Gère la confirmation d'un dodge par majorité"""
-        try:
-            from main import record_dodge, get_player_dodge_count, calculate_dodge_penalty
-            
-            # Enregistrer le dodge
-            record_dodge(self.dodge_confirmed)
-            dodge_penalty = calculate_dodge_penalty(get_player_dodge_count(self.dodge_confirmed))
-            
-            # Déterminer dans quelle équipe était le joueur qui a dodge
-            dodge_in_team1 = self.dodge_confirmed in self.team1_ids
-            
-            if dodge_in_team1:
-                # Le dodge était dans l'équipe 1, l'équipe 2 gagne automatiquement
-                await self.validate_match_with_dodge(team1_wins=False, dodge_player_id=self.dodge_confirmed, dodge_penalty=dodge_penalty)
-            else:
-                # Le dodge était dans l'équipe 2, l'équipe 1 gagne automatiquement
-                await self.validate_match_with_dodge(team1_wins=True, dodge_player_id=self.dodge_confirmed, dodge_penalty=dodge_penalty)
-                
-        except Exception as e:
-            print(f"Erreur dans handle_confirmed_dodge: {e}")
-    
-    async def validate_match_result(self, team1_wins, reason):
-        """Valide automatiquement le résultat du match"""
-        try:
-            from main import (
-                get_player, update_player_elo, calculate_elo_change,
-                save_match_history
-            )
-            
-            # Marquer comme validé et arrêter le refresh
-            self.match_validated = True
-            if self.refresh_task:
-                self.refresh_task.cancel()
-            
-            # Déterminer gagnants et perdants
-            if team1_wins:
-                winner_ids = self.team1_ids
-                loser_ids = self.team2_ids
-                winning_team = "Bleue"
-                winning_color = "🔵"
-            else:
-                winner_ids = self.team2_ids
-                loser_ids = self.team1_ids
-                winning_team = "Rouge"
-                winning_color = "🔴"
-            
-            # Récupérer les joueurs
-            winners = []
-            losers = []
-            winner_elos = []
-            loser_elos = []
-            
-            for player_id in winner_ids:
-                player = get_player(player_id)
-                if player:
-                    winners.append(player)
-                    winner_elos.append(player['elo'])
-            
-            for player_id in loser_ids:
-                player = get_player(player_id)
-                if player:
-                    losers.append(player)
-                    loser_elos.append(player['elo'])
-            
-            if len(winners) != 3 or len(losers) != 3:
-                await self._update_message("❌ Erreur: Impossible de récupérer tous les joueurs")
-                return
-            
-            # Calculer les changements d'ELO
-            winner_avg = sum(winner_elos) / 3
-            loser_avg = sum(loser_elos) / 3
-            
-            winner_elo_changes = []
-            loser_elo_changes = []
-            
-            # Appliquer les changements
-            for i, player in enumerate(winners):
-                old_elo = winner_elos[i]
-                elo_change = calculate_elo_change(old_elo, loser_avg, True)
-                new_elo = max(0, old_elo + elo_change)
-                
-                if update_player_elo(player['discord_id'], new_elo, True):
-                    winner_elo_changes.append(elo_change)
-                else:
-                    await self._update_message("❌ Erreur lors de la mise à jour des ELO")
-                    return
-            
-            for i, player in enumerate(losers):
-                old_elo = loser_elos[i]
-                elo_change = calculate_elo_change(old_elo, winner_avg, False)
-                new_elo = max(0, old_elo + elo_change)
-                
-                if update_player_elo(player['discord_id'], new_elo, False):
-                    loser_elo_changes.append(elo_change)
-                else:
-                    await self._update_message("❌ Erreur lors de la mise à jour des ELO")
-                    return
-            
-            # Désactiver tous les boutons
-            for item in self.children:
-                item.disabled = True
-            
-            # Message de validation
-            validation_message = f"✅ **MATCH VALIDÉ PAR VOTE** ({reason})\n\n"
-            validation_message += f"🏆 VICTOIRE ÉQUIPE {winning_team} {winning_color}\n"
-            validation_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}"
-            
-            # Mettre à jour le message de vote
-            await self._update_message(validation_message)
-            
-            # Créer des objets mock pour la sauvegarde
-            class MockMember:
-                def __init__(self, discord_id, name):
-                    self.id = int(discord_id)
-                    self.display_name = name
-            
-            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
-            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
-            
-            # Sauvegarder pour l'historique (undo)
-            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes)
-            
-            # Envoyer le résumé dans le salon dédié avec réaction d'annulation
-            await self.send_match_summary(winners, losers, winner_elos, loser_elos, 
-                                        winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason)
-            
-        except Exception as e:
-            print(f"Erreur dans validate_match_result: {e}")
-            await self._update_message(f"❌ Erreur lors de la validation: {str(e)}")
-    
-    async def validate_match_with_dodge(self, team1_wins, dodge_player_id, dodge_penalty):
-        """Valide le match avec gestion du dodge"""
-        try:
-            from main import (
-                get_player, update_player_elo, calculate_elo_change,
-                save_match_history
-            )
-            
-            # Marquer comme validé et arrêter le refresh
-            self.match_validated = True
-            if self.refresh_task:
-                self.refresh_task.cancel()
-            
-            # Déterminer gagnants et perdants
-            if team1_wins:
-                winner_ids = self.team1_ids
-                loser_ids = self.team2_ids
-                winning_team = "Bleue"
-                winning_color = "🔵"
-                reason = "dodge adverse confirmé"
-            else:
-                winner_ids = self.team2_ids
-                loser_ids = self.team1_ids
-                winning_team = "Rouge"
-                winning_color = "🔴"
-                reason = "dodge adverse confirmé"
-            
-            # Récupérer les joueurs
-            winners = []
-            losers = []
-            winner_elos = []
-            loser_elos = []
-            
-            for player_id in winner_ids:
-                player = get_player(player_id)
-                if player:
-                    winners.append(player)
-                    winner_elos.append(player['elo'])
-            
-            for player_id in loser_ids:
-                player = get_player(player_id)
-                if player:
-                    losers.append(player)
-                    loser_elos.append(player['elo'])
-            
-            if len(winners) != 3 or len(losers) != 3:
-                return
-            
-            # Calculer les changements d'ELO avec gestion du dodge
-            winner_avg = sum(winner_elos) / 3
-            loser_avg = sum(loser_elos) / 3
-            
-            winner_elo_changes = []
-            loser_elo_changes = []
-            
-            # Appliquer les changements pour les gagnants (réduction car dodge)
-            for i, player in enumerate(winners):
-                old_elo = winner_elos[i]
-                base_change = calculate_elo_change(old_elo, loser_avg, True)
-                # Réduction de 20% car victoire par dodge
-                elo_change = int(base_change * 0.8)
-                new_elo = max(0, old_elo + elo_change)
-                
-                if update_player_elo(player['discord_id'], new_elo, True):
-                    winner_elo_changes.append(elo_change)
-            
-            # Appliquer les changements pour les perdants
-            for i, player in enumerate(losers):
-                old_elo = loser_elos[i]
-                base_change = calculate_elo_change(old_elo, winner_avg, False)
-                
-                if int(player['discord_id']) == dodge_player_id:
-                    # Le joueur qui a dodge perd plus
-                    final_change = base_change - dodge_penalty
-                    new_elo = max(0, old_elo + final_change)
-                    if update_player_elo(player['discord_id'], new_elo, False):
-                        loser_elo_changes.append(final_change)
-                else:
-                    # Ses coéquipiers perdent moins (protection)
-                    protected_change = int(base_change * 0.3)  # Seulement 30% de la perte
-                    new_elo = max(0, old_elo + protected_change)
-                    if update_player_elo(player['discord_id'], new_elo, False):
-                        loser_elo_changes.append(protected_change)
-            
-            # Désactiver tous les boutons
-            for item in self.children:
-                item.disabled = True
-            
-            # Créer des objets mock pour la sauvegarde
-            class MockMember:
-                def __init__(self, discord_id, name):
-                    self.id = int(discord_id)
-                    self.display_name = name
-            
-            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
-            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
-            
-            # Sauvegarder pour l'historique (undo)
-            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes, dodge_player_id)
-            
-            # Envoyer le résumé avec informations de dodge
-            await self.send_match_summary_with_dodge(
-                mock_winners, mock_losers, winner_elos, loser_elos,
-                winner_elo_changes, loser_elo_changes, winner_avg, loser_avg,
-                reason, dodge_player_id, dodge_penalty
-            )
-            
-        except Exception as e:
-            print(f"Erreur dans validate_match_with_dodge: {e}")
-    
-    async def _update_message(self, content):
-        """Met à jour le message actuel"""
-        try:
-            if self.current_message:
-                await self.current_message.edit(content=content, view=self if not self.match_validated else None, suppress_embeds=True)
-        except Exception as e:
-            print(f"Erreur dans _update_message: {e}")
-    
-    async def send_match_summary(self, winners, losers, winner_elos, loser_elos, 
-                                winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason):
-        """Envoie le résumé du match dans le salon dédié"""
-        try:
-            # Construire le message de résultat
-            winning_team = "Bleue" if winners[0]['discord_id'] in [str(id) for id in self.team1_ids] else "Rouge"
-            winning_color = "🔵" if winning_team == "Bleue" else "🔴"
-            losing_color = "🔴" if winning_team == "Bleue" else "🔵"
-            
-            result_message = f"🏆 **RÉSULTAT DE MATCH**\n\n"
-            result_message += f"**Victoire Équipe {winning_team} {winning_color}** (par {reason})\n"
-            result_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
-            
-            result_message += f"{winning_color} **GAGNANTS:**\n"
-            for i, player in enumerate(winners):
-                old_elo = winner_elos[i]
-                change = winner_elo_changes[i]
-                new_elo = old_elo + change
-                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} (+{change})\n"
-            
-            result_message += f"\n{losing_color} **PERDANTS:**\n"
-            for i, player in enumerate(losers):
-                old_elo = loser_elos[i]
-                change = loser_elo_changes[i]
-                new_elo = old_elo + change
-                result_message += f"<@{player['discord_id']}>: {old_elo} → {new_elo} ({change:+})\n"
-            
-            # Statistiques
-            elo_diff = abs(winner_avg - loser_avg)
-            result_message += f"\n📊 **ANALYSE:**\n"
-            result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
-            result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
-            result_message += f"Écart: {round(elo_diff)} points\n\n"
-            result_message += f"↩️ *Réagissez avec ↩️ pour annuler ce match en cas de fraude*"
-            
-            # Envoyer dans le salon de résumés
-            summary_channel = self.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
-            if summary_channel:
-                summary_message = await summary_channel.send(result_message, suppress_embeds=True)
-                # Ajouter la réaction d'annulation
-                await summary_message.add_reaction("↩️")
-                
-                # Sauvegarder l'ID du message pour l'annulation
-                from main import save_match_message_id
-                save_match_message_id(summary_message.id)
-            
-        except Exception as e:
-            print(f"Erreur dans send_match_summary: {e}")
-    
-    async def send_match_summary_with_dodge(self, winners, losers, winner_elos, loser_elos,
-                                           winner_elo_changes, loser_elo_changes, winner_avg, loser_avg,
-                                           reason, dodge_player_id, dodge_penalty):
-        """Envoie le résumé du match avec informations de dodge"""
-        try:
-            from main import save_match_message_id
-            
-            # Construire le message de résultat
-            winning_team = "Bleue" if winners[0].id in self.team1_ids else "Rouge"
-            winning_color = "🔵" if winning_team == "Bleue" else "🔴"
-            losing_color = "🔴" if winning_team == "Bleue" else "🔵"
-            
-            result_message = f"🏆 **RÉSULTAT DE MATCH**\n\n"
-            result_message += f"**Victoire Équipe {winning_team} {winning_color}** (par {reason})\n"
-            result_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
-            
-            result_message += f"🚨 **DODGE CONFIRMÉ:** <@{dodge_player_id}> (-{dodge_penalty} ELO supplémentaire)\n\n"
-            
-            result_message += f"{winning_color} **GAGNANTS:**\n"
-            for i, member in enumerate(winners):
-                old_elo = winner_elos[i]
-                change = winner_elo_changes[i]
-                new_elo = old_elo + change
-                result_message += f"<@{member.id}>: {old_elo} → {new_elo} (+{change}) [Victoire par dodge]\n"
-            
-            result_message += f"\n{losing_color} **PERDANTS:**\n"
-            for i, member in enumerate(losers):
-                old_elo = loser_elos[i]
-                change = loser_elo_changes[i]
-                new_elo = old_elo + change
-                
-                if member.id == dodge_player_id:
-                    result_message += f"🚨 <@{member.id}>: {old_elo} → {new_elo} ({change:+}) [DODGE]\n"
-                else:
-                    result_message += f"<@{member.id}>: {old_elo} → {new_elo} ({change:+}) [Protégé]\n"
-            
-            # Statistiques
-            elo_diff = abs(winner_avg - loser_avg)
-            result_message += f"\n📊 **ANALYSE:**\n"
-            result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
-            result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
-            result_message += f"Écart: {round(elo_diff)} points\n\n"
-            
-            result_message += f"⚠️ **SYSTÈME ANTI-DODGE:**\n"
-            result_message += f"• Pénalité dodge: -{dodge_penalty} ELO\n"
-            result_message += f"• Coéquipiers protégés: -70% perte\n"
-            result_message += f"• Gagnants: -20% gain (victoire par dodge)\n\n"
-            result_message += f"↩️ *Réagissez avec ↩️ pour annuler ce match en cas de fraude*"
-            
-            # Envoyer dans le salon de résumés
-            summary_channel = self.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
-            if summary_channel:
-                summary_message = await summary_channel.send(result_message, suppress_embeds=True)
-                # Ajouter la réaction d'annulation
-                await summary_message.add_reaction("↩️")
-                
-                # Sauvegarder l'ID du message pour l'annulation
-                save_match_message_id(summary_message.id)
-            
-        except Exception as e:
-            print(f"Erreur dans send_match_summary_with_dodge: {e}")
-
-# ================================
-# CLASSES POUR LES BOUTONS ADMIN
-# ================================
-
-class AdminMatchResultView(discord.ui.View):
-    """Vue avec boutons admin pour valider directement (cas d'égalité ou urgence)"""
-    
-    def __init__(self, team1_ids, team2_ids, lobby_id, room_code):
-        super().__init__(timeout=1800)  # 30 minutes de timeout
+        super().__init__(timeout=None)
         self.team1_ids = team1_ids
         self.team2_ids = team2_ids
         self.lobby_id = lobby_id
         self.room_code = room_code
+        self.guild = guild
+        self.votes = {'team1': set(), 'team2': set()}
+        self.dodge_reports = {}
         self.match_validated = False
-    
-    @discord.ui.button(label='🔵 Victoire Équipe Bleue', style=discord.ButtonStyle.primary, emoji='🔵')
-    async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_admin_result(interaction, team1_wins=True)
-    
-    @discord.ui.button(label='🔴 Victoire Équipe Rouge', style=discord.ButtonStyle.danger, emoji='🔴')
-    async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_admin_result(interaction, team1_wins=False)
-    
-    async def handle_admin_result(self, interaction: discord.Interaction, team1_wins: bool):
-        """Traite le résultat du match (admin seulement)"""
+        self.current_message = None
+        self.refresh_task = None
+        
+    async def start_auto_refresh(self):
+        """Démarre le refresh automatique"""
+        self.refresh_task = asyncio.create_task(self._refresh_loop())
+        
+    async def _refresh_loop(self):
+        """Boucle de refresh toutes les 15 minutes"""
         try:
-            # Vérifier les permissions admin
-            if not interaction.user.guild_permissions.administrator:
-                await interaction.response.send_message("❌ Seuls les administrateurs peuvent valider les résultats!", ephemeral=True)
+            while not self.match_validated:
+                await asyncio.sleep(900)  # 15 minutes
+                if not self.match_validated:
+                    await self._refresh_message()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Erreur refresh: {e}")
+    
+    async def _refresh_message(self):
+        """Refresh le message"""
+        try:
+            if not self.current_message or self.match_validated:
                 return
+                
+            channel = self.guild.get_channel(RESULT_CHANNEL_ID)
+            if not channel:
+                return
+                
+            # Créer nouvelle vue avec état actuel
+            new_view = PlayerVoteView(self.team1_ids, self.team2_ids, 
+                                     self.lobby_id, self.room_code, self.guild)
+            new_view.votes = self.votes.copy()
+            new_view.dodge_reports = self.dodge_reports.copy()
             
-            # Vérifier que le match n'a pas déjà été validé
+            # Supprimer ancien message et créer le nouveau
+            try:
+                await self.current_message.delete()
+            except:
+                pass
+                
+            new_message = await channel.send(self._build_message(), view=new_view)
+            new_view.current_message = new_message
+            await new_view.start_auto_refresh()
+            
+            # Arrêter ancien refresh
+            if self.refresh_task:
+                self.refresh_task.cancel()
+                
+        except Exception as e:
+            print(f"Erreur _refresh_message: {e}")
+    
+    def _build_message(self):
+        """Construit le message de vote"""
+        from main import select_random_maps
+        
+        # Équipes
+        team1_mentions = [f"<@{pid}>" for pid in self.team1_ids]
+        team2_mentions = [f"<@{pid}>" for pid in self.team2_ids]
+        
+        # Maps
+        maps = select_random_maps(3)
+        maps_text = '\n'.join([f"• {m}" for m in maps])
+        
+        # Statistiques de vote
+        votes1 = len(self.votes['team1'])
+        votes2 = len(self.votes['team2'])
+        total_votes = votes1 + votes2
+        
+        message = f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{self.lobby_id}\n"
+        message += f"Code: {self.room_code}\n\n"
+        message += f"🔵 **Équipe Bleue** ({votes1} votes):\n{chr(10).join(team1_mentions)}\n\n"
+        message += f"🔴 **Équipe Rouge** ({votes2} votes):\n{chr(10).join(team2_mentions)}\n\n"
+        message += f"🗺️ **Maps:**\n{maps_text}\n\n"
+        message += f"🎮 **Lien:** https://link.nulls.gg/nb/invite/gameroom/fr?tag={self.room_code}\n\n"
+        
+        # Signalements dodge
+        if self.dodge_reports:
+            report_counts = {}
+            for reported_id in self.dodge_reports.values():
+                report_counts[reported_id] = report_counts.get(reported_id, 0) + 1
+            message += "🚨 **SIGNALEMENTS DODGE:**\n"
+            for player_id, count in report_counts.items():
+                message += f"<@{player_id}>: {count} signalement(s)\n"
+            message += "\n"
+        
+        message += f"📊 Votes: {total_votes}/6 | Majorité: 4/6\n"
+        message += "🔄 Auto-refresh: 15min"
+        
+        return message
+    
+    async def safe_respond(self, interaction, content, ephemeral=False):
+        """Réponse sécurisée"""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(content, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content, ephemeral=ephemeral)
+        except:
+            pass
+    
+    @discord.ui.button(label='🔵 Équipe Bleue', style=discord.ButtonStyle.primary)
+    async def team1_win(self, interaction, button):
+        await self.handle_vote(interaction, 'team1')
+    
+    @discord.ui.button(label='🔴 Équipe Rouge', style=discord.ButtonStyle.danger)
+    async def team2_win(self, interaction, button):
+        await self.handle_vote(interaction, 'team2')
+    
+    @discord.ui.button(label='🚨 Signaler Dodge', style=discord.ButtonStyle.secondary)
+    async def report_dodge(self, interaction, button):
+        await self.handle_dodge_report(interaction)
+    
+    async def handle_vote(self, interaction, team):
+        """Gère un vote"""
+        try:
+            user_id = interaction.user.id
+            all_players = set(self.team1_ids + self.team2_ids)
+            
+            if user_id not in all_players:
+                await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent voter!", ephemeral=True)
+                return
+                
             if self.match_validated:
-                await interaction.response.send_message("❌ Ce match a déjà été validé!", ephemeral=True)
+                await self.safe_respond(interaction, "❌ Match déjà validé!", ephemeral=True)
                 return
             
-            # Le reste du code est identique à validate_match_result
-            # (code de validation des ELO etc.)
+            # Retirer vote précédent et ajouter nouveau
+            self.votes['team1'].discard(user_id)
+            self.votes['team2'].discard(user_id)
+            self.votes[team].add(user_id)
+            
+            team_name = "Bleue 🔵" if team == 'team1' else "Rouge 🔴"
+            await self.safe_respond(interaction, f"✅ Vote équipe {team_name} enregistré!", ephemeral=True)
+            
+            # Vérifier conditions de victoire
+            votes1 = len(self.votes['team1'])
+            votes2 = len(self.votes['team2'])
+            
+            if votes1 >= 4:
+                await self.validate_match(True, f"majorité ({votes1} votes)")
+            elif votes2 >= 4:
+                await self.validate_match(False, f"majorité ({votes2} votes)")
+            elif votes1 + votes2 == 6:
+                if votes1 > votes2:
+                    await self.validate_match(True, f"votes finaux ({votes1}-{votes2})")
+                elif votes2 > votes1:
+                    await self.validate_match(False, f"votes finaux ({votes2}-{votes1})")
+                else:
+                    await self._refresh_message()
+            else:
+                await self._refresh_message()
+                
+        except Exception as e:
+            print(f"Erreur handle_vote: {e}")
+    
+    async def handle_dodge_report(self, interaction):
+        """Gère signalement dodge simplifié"""
+        try:
+            user_id = interaction.user.id
+            all_players = set(self.team1_ids + self.team2_ids)
+            
+            if user_id not in all_players or self.match_validated:
+                await self.safe_respond(interaction, "❌ Action non autorisée", ephemeral=True)
+                return
+            
+            # Menu simple avec tous les autres joueurs
+            options = []
+            for pid in all_players:
+                if pid != user_id:
+                    options.append(discord.SelectOption(
+                        label=f"Joueur {pid}",
+                        value=str(pid)
+                    ))
+            
+            if options:
+                select = DodgeSelect(options, self, user_id)
+                view = discord.ui.View(timeout=300)
+                view.add_item(select)
+                await self.safe_respond(interaction, "Sélectionnez le joueur:", view=view, ephemeral=True)
+                
+        except Exception as e:
+            print(f"Erreur handle_dodge_report: {e}")
+    
+    async def process_dodge_report(self, reporter_id, reported_id):
+        """Traite un signalement dodge"""
+        try:
+            self.dodge_reports[reporter_id] = int(reported_id)
+            
+            # Compter signalements
+            counts = {}
+            for rep_id in self.dodge_reports.values():
+                counts[rep_id] = counts.get(rep_id, 0) + 1
+            
+            # Vérifier majorité (3+ signalements)
+            for player_id, count in counts.items():
+                if count >= 3:
+                    await self.handle_confirmed_dodge(player_id)
+                    return
+            
+            await self._refresh_message()
             
         except Exception as e:
-            print(f"Erreur dans handle_admin_result: {e}")
+            print(f"Erreur process_dodge_report: {e}")
+    
+    async def handle_confirmed_dodge(self, dodge_player_id):
+        """Gère dodge confirmé"""
+        try:
+            from main import record_dodge, get_player_dodge_count, calculate_dodge_penalty
+            
+            record_dodge(dodge_player_id)
+            penalty = calculate_dodge_penalty(get_player_dodge_count(dodge_player_id))
+            
+            # Équipe du dodger perd automatiquement
+            team1_wins = dodge_player_id not in self.team1_ids
+            await self.validate_match_with_dodge(team1_wins, dodge_player_id, penalty)
+            
+        except Exception as e:
+            print(f"Erreur handle_confirmed_dodge: {e}")
+    
+    async def validate_match(self, team1_wins, reason):
+        """Valide le match standard"""
+        await self._validate_match_internal(team1_wins, reason)
+    
+    async def validate_match_with_dodge(self, team1_wins, dodge_player_id, penalty):
+        """Valide le match avec dodge"""
+        await self._validate_match_internal(team1_wins, "dodge confirmé", dodge_player_id, penalty)
+    
+    async def _validate_match_internal(self, team1_wins, reason, dodge_player_id=None, dodge_penalty=0):
+        """Validation interne unifiée"""
+        try:
+            from main import get_player, update_player_elo, calculate_elo_change, save_match_history
+            
+            self.match_validated = True
+            if self.refresh_task:
+                self.refresh_task.cancel()
+            
+            # Déterminer gagnants/perdants
+            winner_ids = self.team1_ids if team1_wins else self.team2_ids
+            loser_ids = self.team2_ids if team1_wins else self.team1_ids
+            
+            # Récupérer joueurs et ELO
+            winners, losers = [], []
+            winner_elos, loser_elos = [], []
+            
+            for pid in winner_ids:
+                player = get_player(pid)
+                if player:
+                    winners.append(player)
+                    winner_elos.append(player['elo'])
+            
+            for pid in loser_ids:
+                player = get_player(pid)
+                if player:
+                    losers.append(player)
+                    loser_elos.append(player['elo'])
+            
+            if len(winners) != 3 or len(losers) != 3:
+                return
+            
+            # Calculer changements ELO
+            winner_avg = sum(winner_elos) / 3
+            loser_avg = sum(loser_elos) / 3
+            
+            winner_changes, loser_changes = [], []
+            
+            # Appliquer changements
+            for i, player in enumerate(winners):
+                old_elo = winner_elos[i]
+                change = calculate_elo_change(old_elo, loser_avg, True)
+                if dodge_player_id:
+                    change = int(change * 0.8)  # Réduction si dodge
+                new_elo = max(0, old_elo + change)
+                update_player_elo(player['discord_id'], new_elo, True)
+                winner_changes.append(change)
+            
+            for i, player in enumerate(losers):
+                old_elo = loser_elos[i]
+                change = calculate_elo_change(old_elo, winner_avg, False)
+                
+                if dodge_player_id and int(player['discord_id']) == dodge_player_id:
+                    change -= dodge_penalty
+                elif dodge_player_id:
+                    change = int(change * 0.3)  # Protection coéquipiers
+                
+                new_elo = max(0, old_elo + change)
+                update_player_elo(player['discord_id'], new_elo, False)
+                loser_changes.append(change)
+            
+            # Désactiver boutons
+            for item in self.children:
+                item.disabled = True
+            
+            # Message de validation
+            team_name = "Bleue" if team1_wins else "Rouge"
+            validation_msg = f"✅ **MATCH VALIDÉ** ({reason})\n🏆 Victoire Équipe {team_name}\nLobby #{self.lobby_id}"
+            await self._update_message(validation_msg)
+            
+            # Créer objets mock et sauvegarder
+            class MockMember:
+                def __init__(self, discord_id, name):
+                    self.id = int(discord_id)
+                    self.display_name = name
+            
+            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
+            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
+            
+            save_match_history(mock_winners, mock_losers, winner_changes, loser_changes,
+                             dodge_player_id if dodge_player_id else None)
+            
+            # Envoyer résumé
+            await self.send_match_summary(mock_winners, mock_losers, winner_elos, loser_elos,
+                                        winner_changes, loser_changes, reason, dodge_player_id, dodge_penalty)
+            
+        except Exception as e:
+            print(f"Erreur _validate_match_internal: {e}")
+    
+    async def _update_message(self, content):
+        """Met à jour le message"""
+        try:
+            if self.current_message:
+                await self.current_message.edit(content=content, view=self if not self.match_validated else None)
+        except Exception as e:
+            print(f"Erreur _update_message: {e}")
+    
+    async def send_match_summary(self, winners, losers, winner_elos, loser_elos,
+                               winner_changes, loser_changes, reason, dodge_player_id=None, dodge_penalty=0):
+        """Envoie le résumé du match"""
+        try:
+            from main import save_match_message_id
+            
+            # Construire message
+            winning_team = "Bleue 🔵" if winners[0].id in self.team1_ids else "Rouge 🔴"
+            
+            message = f"🏆 **RÉSULTAT DE MATCH**\n\n"
+            message += f"**Victoire Équipe {winning_team}** ({reason})\n"
+            message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
+            
+            if dodge_player_id:
+                message += f"🚨 **DODGE:** <@{dodge_player_id}> (-{dodge_penalty} ELO)\n\n"
+            
+            message += "🏆 **GAGNANTS:**\n"
+            for i, member in enumerate(winners):
+                old_elo = winner_elos[i]
+                change = winner_changes[i]
+                new_elo = old_elo + change
+                suffix = " [Dodge]" if dodge_player_id else ""
+                message += f"<@{member.id}>: {old_elo} → {new_elo} (+{change}){suffix}\n"
+            
+            message += "\n💀 **PERDANTS:**\n"
+            for i, member in enumerate(losers):
+                old_elo = loser_elos[i]
+                change = loser_changes[i]
+                new_elo = old_elo + change
+                
+                if dodge_player_id and member.id == dodge_player_id:
+                    message += f"🚨 <@{member.id}>: {old_elo} → {new_elo} ({change:+}) [DODGER]\n"
+                elif dodge_player_id:
+                    message += f"<@{member.id}>: {old_elo} → {new_elo} ({change:+}) [Protégé]\n"
+                else:
+                    message += f"<@{member.id}>: {old_elo} → {new_elo} ({change:+})\n"
+            
+            # Statistiques
+            winner_avg = sum(winner_elos) / 3
+            loser_avg = sum(loser_elos) / 3
+            message += f"\n📊 ELO moyen: Gagnants {round(winner_avg)} | Perdants {round(loser_avg)}"
+            message += f"\n↩️ *Réagissez avec ↩️ pour annuler ce match*"
+            
+            # Envoyer avec réaction
+            summary_channel = self.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
+            if summary_channel:
+                summary_msg = await summary_channel.send(message)
+                await summary_msg.add_reaction("↩️")
+                save_match_message_id(summary_msg.id)
+                
+        except Exception as e:
+            print(f"Erreur send_match_summary: {e}")
+
+class DodgeSelect(discord.ui.Select):
+    """Menu de sélection pour dodge"""
+    
+    def __init__(self, options, vote_view, reporter_id):
+        super().__init__(placeholder="Choisir le joueur qui a dodge...", options=options)
+        self.vote_view = vote_view
+        self.reporter_id = reporter_id
+    
+    async def callback(self, interaction):
+        try:
+            reported_id = int(self.values[0])
+            await self.vote_view.process_dodge_report(self.reporter_id, reported_id)
+            await self.vote_view.safe_respond(interaction, f"✅ Signalement enregistré", ephemeral=True)
+        except Exception as e:
+            await self.vote_view.safe_respond(interaction, "❌ Erreur", ephemeral=True)
 
 # ================================
-# COMMANDES ULTRA SIMPLES
+# COMMANDES SIMPLIFIÉES
 # ================================
 
 async def create_lobby_cmd(ctx, room_code: str = None):
-    """!create <code_room> - Créer un lobby"""
-    from main import (
-        get_player, create_player, create_lobby, add_player_to_lobby,
-        get_all_lobbies, MAX_CONCURRENT_LOBBIES, PING_ROLE_ID
-    )
+    """!create <code> - Créer un lobby"""
+    from main import (get_player, create_player, create_lobby, add_player_to_lobby,
+                     get_all_lobbies, MAX_CONCURRENT_LOBBIES, PING_ROLE_ID)
     
     if not room_code:
-        message = "❌ Usage: !create <code_room>"
-        await ctx.send(message, suppress_embeds=True)
-
-# ================================
-# COMMANDES ADMIN
-# ================================
-
-async def record_manual_match_result(
-    interaction: discord.Interaction,
-    gagnant1: discord.Member,
-    gagnant2: discord.Member,
-    gagnant3: discord.Member,
-    perdant1: discord.Member,
-    perdant2: discord.Member,
-    perdant3: discord.Member,
-    dodge_joueur: Optional[discord.Member] = None,
-    score: Optional[Literal["2-0", "2-1"]] = None
-):
-    """Enregistrer manuellement le résultat d'un match (admin uniquement)"""
-    from main import (
-        get_player, create_player, update_player_elo, calculate_elo_change,
-        record_dodge, get_player_dodge_count, calculate_dodge_penalty, save_match_history,
-        save_match_message_id
-    )
+        await ctx.send("❌ Usage: !create <code_room>")
+        return
     
-    # Répondre immédiatement pour éviter l'expiration
-    await interaction.response.send_message("⏳ Traitement du match en cours...", ephemeral=True)
+    # Vérifier/créer joueur
+    player = get_player(ctx.author.id)
+    if not player:
+        create_player(ctx.author.id, ctx.author.display_name)
+        # Attribuer le rôle ping au nouveau joueur
+        await ensure_player_has_ping_role(ctx.guild, ctx.author.id)
+    
+    # Créer lobby
+    lobby_id, msg = create_lobby(room_code.upper())
+    if not lobby_id:
+        await ctx.send(f"❌ {msg}")
+        return
+    
+    # Ajouter créateur
+    success, join_msg = add_player_to_lobby(lobby_id, ctx.author.id)
+    if success:
+        role_mention = f"<@&{PING_ROLE_ID}>"
+        message = (f"{role_mention}\n\n🎮 **NOUVEAU LOBBY #{lobby_id}**\n"
+                  f"Code: {room_code.upper()}\n"
+                  f"Créateur: {ctx.author.display_name}\n"
+                  f"Rejoindre: !join {lobby_id}")
+        await ctx.send(message)
+    else:
+        await ctx.send(f"❌ {join_msg}")
+
+async def join_lobby_cmd(ctx, lobby_id: int = None):
+    """!join <id> - Rejoindre un lobby"""
+    from main import (get_player, create_player, add_player_to_lobby, get_lobby,
+                     create_random_teams, get_connection)
+    
+    if not lobby_id:
+        await ctx.send("❌ Usage: !join <id_lobby>")
+        return
+    
+    # Vérifier/créer joueur
+    player = get_player(ctx.author.id)
+    if not player:
+        create_player(ctx.author.id, ctx.author.display_name)
+        # Attribuer le rôle ping au nouveau joueur
+        await ensure_player_has_ping_role(ctx.guild, ctx.author.id)
+    else:
+        # S'assurer que le joueur existant a le rôle ping
+        await ensure_player_has_ping_role(ctx.guild, ctx.author.id)
+    
+    # Rejoindre
+    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
+    if not success:
+        await ctx.send(f"❌ {msg}")
+        return
+    
+    # Vérifier si lobby complet
+    lobby = get_lobby(lobby_id)
+    if lobby:
+        players = lobby['players'].split(',') if lobby['players'] else []
+        if len(players) >= 6:
+            # Lancer le match
+            team1_ids, team2_ids = create_random_teams([int(id) for id in players])
+            
+            await ctx.send(f"🚀 **MATCH LANCÉ!** Lobby #{lobby_id} - Équipes créées!")
+            
+            # Créer vote dans salon admin
+            vote_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
+            if vote_channel:
+                vote_view = PlayerVoteView(team1_ids, team2_ids, lobby_id, lobby['room_code'], ctx.guild)
+                vote_msg = await vote_channel.send(vote_view._build_message(), view=vote_view)
+                vote_view.current_message = vote_msg
+                await vote_view.start_auto_refresh()
+            
+            # Supprimer lobby
+            conn = get_connection()
+            if conn:
+                try:
+                    with conn.cursor() as c:
+                        c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
+                        conn.commit()
+                finally:
+                    conn.close()
+        else:
+            await ctx.send(f"✅ Rejoint! ({len(players)}/6 joueurs)")
+
+async def leave_lobby_cmd(ctx):
+    """!leave - Quitter son lobby"""
+    from main import remove_player_from_lobby
+    success, msg = remove_player_from_lobby(ctx.author.id)
+    await ctx.send(f"{'👋' if success else '❌'} {msg}")
+
+async def show_elo_cmd(ctx):
+    """!elo - Voir son ELO"""
+    from main import get_player, get_leaderboard, get_player_dodge_count
+    
+    player = get_player(ctx.author.id)
+    if not player:
+        await ctx.send("❌ Non inscrit. Utilisez !create <code> pour vous inscrire.")
+        return
+    
+    # S'assurer que le joueur a le rôle ping
+    await ensure_player_has_ping_role(ctx.guild, ctx.author.id)
+    
+    # Calculer rang
+    players = get_leaderboard()
+    rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
+    
+    winrate = round(player['wins'] / max(1, player['wins'] + player['losses']) * 100, 1)
+    dodge_count = get_player_dodge_count(ctx.author.id)
+    
+    message = (f"📊 **{ctx.author.display_name}**\n"
+              f"ELO: {player['elo']} | Rang: #{rank}\n"
+              f"W/L: {player['wins']}/{player['losses']} ({winrate}%)")
+    
+    if dodge_count > 0:
+        message += f"\n🚨 Dodges: {dodge_count}"
+    
+    await ctx.send(message)
+
+async def leaderboard_cmd(ctx):
+    """!leaderboard - Classement"""
+    from main import get_leaderboard, get_player
+    
+    players = get_leaderboard()[:10]
+    if not players:
+        await ctx.send("📊 Classement vide")
+        return
+    
+    message = "🏆 **CLASSEMENT ELO**\n\n"
+    
+    for i, player in enumerate(players, 1):
+        try:
+            member = ctx.guild.get_member(int(player['discord_id']))
+            name = member.display_name if member else player['name']
+        except:
+            name = player['name']
+        
+        winrate = round(player['wins'] / max(1, player['wins'] + player['losses']) * 100, 1)
+        emoji = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
+        message += f"{emoji} {name} - {player['elo']} ELO ({winrate}%)\n"
+    
+    # Position joueur actuel
+    current_player = get_player(ctx.author.id)
+    if current_player:
+        all_players = get_leaderboard()
+        pos = next((i for i, p in enumerate(all_players, 1) if p['discord_id'] == str(ctx.author.id)), None)
+        if pos:
+            message += f"\n**Votre position:** #{pos} - {current_player['elo']} ELO"
+    
+    await ctx.send(message)
+
+async def list_lobbies_cmd(ctx):
+    """!lobbies - Liste des lobbies"""
+    from main import get_all_lobbies, get_cooldown_info, MAX_CONCURRENT_LOBBIES
+    
+    lobbies = get_all_lobbies()
+    cooldown = get_cooldown_info()
+    
+    message = f"🎮 **LOBBIES** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES})\n\n"
+    
+    if not lobbies:
+        message += "Aucun lobby actif\n"
+    else:
+        for lobby in lobbies:
+            players_count = len(lobby['players'].split(',')) if lobby['players'] else 0
+            status = "🟢" if players_count < 6 else "🔴"
+            message += f"{status} #{lobby['id']} - {lobby['room_code']} ({players_count}/6)\n"
+    
+    if cooldown and cooldown.get('active'):
+        message += f"\n⏰ Cooldown: {cooldown['remaining_minutes']}m {cooldown['remaining_seconds']}s"
+    else:
+        message += "\n✅ Création possible"
+    
+    await ctx.send(message)
+
+# ================================
+# COMMANDES ADMIN SIMPLIFIÉES
+# ================================
+
+async def record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
+                                   perdant1, perdant2, perdant3, dodge_joueur=None, score=None):
+    """Enregistrement manuel de match par admin"""
+    from main import (get_player, create_player, update_player_elo, calculate_elo_change,
+                     record_dodge, get_player_dodge_count, calculate_dodge_penalty,
+                     save_match_history, save_match_message_id)
+    
+    await interaction.response.send_message("⏳ Traitement...", ephemeral=True)
     
     winners = [gagnant1, gagnant2, gagnant3]
     losers = [perdant1, perdant2, perdant3]
-    
-    # Vérifier qu'il n'y a pas de doublons
     all_members = winners + losers
-    unique_ids = set(member.id for member in all_members)
     
-    if len(unique_ids) != 6:
-        await interaction.edit_original_response(content="❌ Erreur: Chaque joueur ne peut apparaître qu'une seule fois")
+    # Vérifications
+    if len(set(m.id for m in all_members)) != 6:
+        await interaction.edit_original_response(content="❌ Chaque joueur ne peut apparaître qu'une fois")
         return
     
-    # Vérifier que le dodge_joueur fait partie des 6 joueurs
     if dodge_joueur and dodge_joueur not in all_members:
-        await interaction.edit_original_response(content="❌ Erreur: Le joueur qui a dodge doit faire partie des 6 joueurs du match")
+        await interaction.edit_original_response(content="❌ Le dodger doit faire partie des 6 joueurs")
         return
     
-    # Vérifier que tous sont inscrits
+    # Créer/vérifier joueurs et attribuer rôles
     for member in all_members:
-        player = get_player(member.id)
-        if not player:
+        if not get_player(member.id):
             create_player(member.id, member.display_name)
+        await ensure_player_has_ping_role(interaction.guild, member.id)
     
-    # Si dodge, enregistrer et calculer les pénalités
+    # Gestion dodge
     dodge_penalty = 0
     if dodge_joueur:
         record_dodge(dodge_joueur.id)
         dodge_penalty = calculate_dodge_penalty(get_player_dodge_count(dodge_joueur.id))
     
-    # Calculer nouveaux ELO
-    winner_elos = []
-    loser_elos = []
-    
-    for member in winners:
-        player = get_player(member.id)
-        if player:
-            winner_elos.append(player['elo'])
-        else:
-            await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer les données des joueurs")
-            return
-    
-    for member in losers:
-        player = get_player(member.id)
-        if player:
-            loser_elos.append(player['elo'])
-        else:
-            await interaction.edit_original_response(content="❌ Erreur: Impossible de récupérer les données des joueurs")
-            return
-    
+    # Calculer ELO
+    winner_elos = [get_player(m.id)['elo'] for m in winners]
+    loser_elos = [get_player(m.id)['elo'] for m in losers]
     winner_avg = sum(winner_elos) / 3
     loser_avg = sum(loser_elos) / 3
     
-    # Préparer les changements ELO
-    winner_elo_changes = []
-    loser_elo_changes = []
+    winner_changes, loser_changes = [], []
     
-    # Mettre à jour ELO avec gestion des dodges
+    # Appliquer changements
     for i, member in enumerate(winners):
         old_elo = winner_elos[i]
-        base_change = calculate_elo_change(old_elo, loser_avg, True)
-        
-        # Réduction si dodge (les gagnants gagnent un peu moins)
+        change = calculate_elo_change(old_elo, loser_avg, True)
         if dodge_joueur:
-            base_change = int(base_change * 0.8)  # 20% de réduction
-        
-        new_elo = max(0, old_elo + base_change)
-        if update_player_elo(member.id, new_elo, True):
-            winner_elo_changes.append(base_change)
-        else:
-            await interaction.edit_original_response(content="❌ Erreur mise à jour ELO")
-            return
+            change = int(change * 0.8)
+        new_elo = max(0, old_elo + change)
+        update_player_elo(member.id, new_elo, True)
+        winner_changes.append(change)
     
     for i, member in enumerate(losers):
         old_elo = loser_elos[i]
-        base_change = calculate_elo_change(old_elo, winner_avg, False)
+        change = calculate_elo_change(old_elo, winner_avg, False)
         
         if dodge_joueur and member.id == dodge_joueur.id:
-            # Le joueur qui a dodge perd plus
-            final_change = base_change - dodge_penalty
-            new_elo = max(0, old_elo + final_change)
-            if update_player_elo(member.id, new_elo, False):
-                loser_elo_changes.append(final_change)
-            else:
-                await interaction.edit_original_response(content="❌ Erreur mise à jour ELO")
-                return
-        else:
-            # Ses coéquipiers perdent moins si dodge
-            if dodge_joueur and dodge_joueur in losers:
-                base_change = int(base_change * 0.3)  # Seulement 30% de la perte normale
-            
-            new_elo = max(0, old_elo + base_change)
-            if update_player_elo(member.id, new_elo, False):
-                loser_elo_changes.append(base_change)
-            else:
-                await interaction.edit_original_response(content="❌ Erreur mise à jour ELO")
-                return
+            change -= dodge_penalty
+        elif dodge_joueur:
+            change = int(change * 0.3)
+        
+        new_elo = max(0, old_elo + change)
+        update_player_elo(member.id, new_elo, False)
+        loser_changes.append(change)
     
-    # Sauvegarder pour l'historique (undo)
-    save_match_history(winners, losers, winner_elo_changes, loser_elo_changes, 
+    # Sauvegarder historique
+    save_match_history(winners, losers, winner_changes, loser_changes,
                       dodge_joueur.id if dodge_joueur else None)
     
-    # Construire le message de résumé
-    result_message = f"🏆 **RÉSULTAT DE MATCH** (Validation Admin)\n\n"
-    
-    # Afficher le score si fourni
+    # Construire résumé
+    message = "🏆 **RÉSULTAT MATCH** (Admin)\n\n"
     if score:
-        result_message += f"**Score: {score}**\n\n"
-    
-    # Afficher info dodge
+        message += f"Score: {score}\n"
     if dodge_joueur:
-        result_message += f"🚨 **DODGE:** {dodge_joueur.display_name}\n"
-        dodge_count = get_player_dodge_count(dodge_joueur.id)
-        result_message += f"Dodges total: {dodge_count} (-{dodge_penalty} ELO supplémentaire)\n\n"
+        message += f"🚨 Dodge: {dodge_joueur.display_name} (-{dodge_penalty})\n"
     
-    result_message += "🏆 **GAGNANTS:**\n"
+    message += "\n🏆 **GAGNANTS:**\n"
     for i, member in enumerate(winners):
         old_elo = winner_elos[i]
-        change = winner_elo_changes[i]
-        new_elo = old_elo + change
-        result_message += f"{member.display_name}: {old_elo} → {new_elo} (+{change})\n"
+        change = winner_changes[i]
+        message += f"{member.display_name}: {old_elo} → {old_elo + change} (+{change})\n"
     
-    result_message += "\n💀 **PERDANTS:**\n"
+    message += "\n💀 **PERDANTS:**\n"
     for i, member in enumerate(losers):
         old_elo = loser_elos[i]
-        change = loser_elo_changes[i]
-        new_elo = old_elo + change
-        
-        if dodge_joueur and member.id == dodge_joueur.id:
-            result_message += f"🚨 {member.display_name}: {old_elo} → {new_elo} ({change:+}) [DODGE]\n"
-        else:
-            dodge_indicator = " [Victime]" if dodge_joueur and dodge_joueur in losers else ""
-            result_message += f"{member.display_name}: {old_elo} → {new_elo} ({change:+}){dodge_indicator}\n"
+        change = loser_changes[i]
+        suffix = " [DODGE]" if dodge_joueur and member.id == dodge_joueur.id else " [Protégé]" if dodge_joueur else ""
+        message += f"{member.display_name}: {old_elo} → {old_elo + change} ({change:+}){suffix}\n"
     
-    # Statistiques du match
-    elo_diff = abs(winner_avg - loser_avg)
-    result_message += f"\n📊 **ANALYSE:**\n"
-    result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
-    result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
-    result_message += f"Écart: {round(elo_diff)} points"
+    message += f"\n📊 ELO moyen: G{round(winner_avg)} | P{round(loser_avg)}"
+    message += "\n↩️ *Réagissez ↩️ pour annuler*"
     
-    if dodge_joueur:
-        result_message += f"\n\n⚠️ **SYSTÈME ANTI-DODGE:**\n"
-        result_message += f"• Pénalité dodge: -{dodge_penalty} ELO\n"
-        result_message += f"• Coéquipiers protégés: -70% perte\n"
-        result_message += f"• Gagnants: -20% gain"
-    
-    result_message += f"\n\n↩️ *Réagissez avec ↩️ pour annuler ce match en cas de fraude*"
-    
-    # Envoyer le résumé dans le salon dédié avec réaction d'annulation
+    # Envoyer résumé
     summary_channel = interaction.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
     if summary_channel:
-        summary_message = await summary_channel.send(result_message, suppress_embeds=True)
-        # Ajouter la réaction d'annulation
-        await summary_message.add_reaction("↩️")
-        
-        # Sauvegarder l'ID du message pour l'annulation
-        save_match_message_id(summary_message.id)
+        summary_msg = await summary_channel.send(message)
+        await summary_msg.add_reaction("↩️")
+        save_match_message_id(summary_msg.id)
     
-    # Confirmer à l'admin
-    await interaction.edit_original_response(content="✅ Match enregistré avec succès! Résumé envoyé dans le salon dédié.")
-
-async def reset_cooldown_cmd(ctx):
-    """!resetcd - Reset le cooldown (admin seulement)"""
-    from main import get_connection, LOBBY_COOLDOWN_MINUTES
-    
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    conn = get_connection()
-    if not conn:
-        message = "❌ Erreur de connexion à la base"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    try:
-        with conn.cursor() as c:
-            # Reset le cooldown en mettant une date dans le passé
-            c.execute('''
-                UPDATE lobby_cooldown 
-                SET last_creation = CURRENT_TIMESTAMP - INTERVAL '%s minutes'
-                WHERE id = 1
-            ''', (LOBBY_COOLDOWN_MINUTES + 1,))
-            conn.commit()
-        
-        message = "✅ Cooldown reset! Création de lobby possible immédiatement."
-        await ctx.send(message, suppress_embeds=True)
-    except Exception as e:
-        message = f"❌ Erreur lors du reset: {str(e)}"
-        await ctx.send(message, suppress_embeds=True)
-    finally:
-        conn.close()
-
-async def clear_lobbies_cmd(ctx):
-    """!clearlobbies - Supprimer tous les lobbies (admin seulement)"""
-    from main import get_connection
-    
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    conn = get_connection()
-    if not conn:
-        message = "❌ Erreur de connexion à la base"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    try:
-        with conn.cursor() as c:
-            c.execute('SELECT COUNT(*) as count FROM lobbies')
-            count = c.fetchone()['count']
-            
-            c.execute('DELETE FROM lobbies')
-            conn.commit()
-        
-        message = f"🗑️ {count} lobby(s) supprimé(s)"
-        await ctx.send(message, suppress_embeds=True)
-    except Exception as e:
-        message = f"❌ Erreur: {str(e)}"
-        await ctx.send(message, suppress_embeds=True)
-    finally:
-        conn.close()
-
-async def undo_match_cmd(ctx):
-    """!undo - Annuler le dernier match (admin seulement)"""
-    from main import undo_last_match
-    
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    success, result = undo_last_match()
-    
-    if success:
-        message = "🔄 MATCH ANNULE!\n\n"
-        message += f"🏆 Anciens gagnants: {', '.join(result['winners'])}\n"
-        message += f"💀 Anciens perdants: {', '.join(result['losers'])}\n\n"
-        message += f"📊 Changements ELO annulés:\n"
-        
-        for i, name in enumerate(result['winners']):
-            change = result['winner_changes'][i]
-            message += f"  {name}: -{change} ELO\n"
-        
-        for i, name in enumerate(result['losers']):
-            change = result['loser_changes'][i]
-            message += f"  {name}: -{change} ELO\n"
-        
-        if result['had_dodge']:
-            message += f"\n🚨 Dodge également annulé"
-        
-        message += "\n✅ Tous les changements ont été inversés"
-    else:
-        message = f"❌ Erreur: {result}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def add_elo_cmd(ctx, member: discord.Member, amount: int):
-    """!addelo @joueur montant - Ajouter de l'ELO à un joueur (admin seulement)"""
-    from main import get_player, create_player, update_player_elo_only
-    
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    if amount <= 0:
-        message = "❌ Le montant doit être positif"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Vérifier/créer le joueur
-    player = get_player(member.id)
-    if not player:
-        if not create_player(member.id, member.display_name):
-            message = "❌ Erreur: Impossible de créer le profil du joueur"
-            await ctx.send(message, suppress_embeds=True)
-            return
-        player = get_player(member.id)
-    
-    old_elo = player['elo']
-    new_elo = old_elo + amount
-    
-    if update_player_elo_only(member.id, new_elo):
-        message = f"✅ ELO AJOUTÉ\n"
-        message += f"Joueur: {member.display_name}\n"
-        message += f"Ancien ELO: {old_elo}\n"
-        message += f"Nouveau ELO: {new_elo} (+{amount})\n"
-        message += f"Modifié par: {ctx.author.display_name}"
-    else:
-        message = "❌ Erreur lors de la mise à jour de l'ELO"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def remove_elo_cmd(ctx, member: discord.Member, amount: int):
-    """!removeelo @joueur montant - Retirer de l'ELO à un joueur (admin seulement)"""
-    from main import get_player, create_player, update_player_elo_only
-    
-    if not ctx.author.guild_permissions.administrator:
-        message = "❌ Commande réservée aux administrateurs"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    if amount <= 0:
-        message = "❌ Le montant doit être positif"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Vérifier/créer le joueur
-    player = get_player(member.id)
-    if not player:
-        if not create_player(member.id, member.display_name):
-            message = "❌ Erreur: Impossible de créer le profil du joueur"
-            await ctx.send(message, suppress_embeds=True)
-            return
-        player = get_player(member.id)
-    
-    old_elo = player['elo']
-    new_elo = max(0, old_elo - amount)  # L'ELO ne peut pas descendre en dessous de 0
-    actual_removed = old_elo - new_elo
-    
-    if update_player_elo_only(member.id, new_elo):
-        message = f"✅ ELO RETIRÉ\n"
-        message += f"Joueur: {member.display_name}\n"
-        message += f"Ancien ELO: {old_elo}\n"
-        message += f"Nouveau ELO: {new_elo} (-{actual_removed})\n"
-        
-        if actual_removed < amount:
-            message += f"⚠️ Seulement {actual_removed} ELO retiré (minimum 0)\n"
-        
-        message += f"Modifié par: {ctx.author.display_name}"
-    else:
-        message = "❌ Erreur lors de la mise à jour de l'ELO"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-# ================================
-# GESTION DES RÉACTIONS D'ANNULATION
-# ================================
+    await interaction.edit_original_response(content="✅ Match enregistré!")
 
 async def handle_match_cancel_reaction(payload):
-    """Gère l'annulation d'un match par réaction ↩️"""
+    """Gère l'annulation par réaction ↩️"""
     try:
-        from main import is_match_message, undo_last_match
+        from main import is_match_message, undo_last_match, remove_match_message_id
         
-        # Vérifier que c'est la bonne réaction et le bon salon
-        if str(payload.emoji) != "↩️":
+        if str(payload.emoji) != "↩️" or payload.channel_id != MATCH_SUMMARY_CHANNEL_ID:
             return
         
-        if payload.channel_id != MATCH_SUMMARY_CHANNEL_ID:
-            return
-        
-        # Vérifier que c'est un message de match
         if not is_match_message(payload.message_id):
             return
         
-        # Récupérer l'utilisateur et vérifier les permissions
+        # Vérifier permissions admin
         guild = payload.member.guild if payload.member else None
         if not guild:
             return
@@ -1157,47 +789,47 @@ async def handle_match_cancel_reaction(payload):
         if not member or not member.guild_permissions.administrator:
             return
         
-        # Annuler le match
+        # Annuler match
         success, result = undo_last_match()
-        
         if success:
-            # Récupérer le canal et le message
             channel = guild.get_channel(payload.channel_id)
             if channel:
                 try:
                     message = await channel.fetch_message(payload.message_id)
-                    
-                    # Modifier le message pour indiquer l'annulation
-                    cancel_message = f"❌ **MATCH ANNULÉ** par {member.display_name}\n\n"
-                    cancel_message += f"🔄 Anciens gagnants: {', '.join(result['winners'])}\n"
-                    cancel_message += f"🔄 Anciens perdants: {', '.join(result['losers'])}\n\n"
-                    cancel_message += "📊 Tous les changements ELO ont été annulés"
+                    cancel_msg = f"❌ **MATCH ANNULÉ** par {member.display_name}\n\n"
+                    cancel_msg += f"🔄 Gagnants: {', '.join(result['winners'])}\n"
+                    cancel_msg += f"🔄 Perdants: {', '.join(result['losers'])}\n"
+                    cancel_msg += "📊 Changements ELO annulés"
                     
                     if result['had_dodge']:
-                        cancel_message += "\n🚨 Dodge également annulé"
+                        cancel_msg += "\n🚨 Dodge annulé"
                     
-                    await message.edit(content=cancel_message, suppress_embeds=True)
+                    await message.edit(content=cancel_msg)
                     await message.clear_reactions()
-                    
-                    # Retirer ce message de la liste des messages de match
-                    from main import remove_match_message_id
                     remove_match_message_id(payload.message_id)
-                    
-                except Exception as e:
-                    print(f"Erreur modification message annulation: {e}")
-        
+                except:
+                    pass
     except Exception as e:
-        print(f"Erreur dans handle_match_cancel_reaction: {e}")
+        print(f"Erreur handle_match_cancel_reaction: {e}")
 
 # ================================
-# SETUP FONCTION
+# SETUP FONCTION PRINCIPALE
 # ================================
 
 async def setup_commands(bot):
     """Configure toutes les commandes du bot"""
-    from main import (
-        MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES, PING_ROLE_ID
-    )
+    
+    # Attribution automatique des rôles au démarrage
+    @bot.event
+    async def on_ready_role_assignment():
+        """Attribue le rôle ping à tous les joueurs existants au démarrage"""
+        for guild in bot.guilds:
+            assigned = await assign_ping_role_to_all_players(guild)
+            if assigned > 0:
+                print(f"🎯 {assigned} rôles ping attribués dans {guild.name}")
+    
+    # Appeler l'attribution au démarrage
+    bot.add_listener(on_ready_role_assignment, 'on_ready')
     
     # Commandes prefix
     @bot.command(name='create')
@@ -1224,401 +856,161 @@ async def setup_commands(bot):
     async def _leaderboard(ctx):
         await leaderboard_cmd(ctx)
     
-    @bot.command(name='status')
-    async def _status(ctx):
-        await lobby_status_cmd(ctx)
-    
+    # Commandes admin simplifiées
     @bot.command(name='resetcd')
     async def _resetcd(ctx):
-        await reset_cooldown_cmd(ctx)
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        from main import get_connection, LOBBY_COOLDOWN_MINUTES
+        conn = get_connection()
+        if conn:
+            try:
+                with conn.cursor() as c:
+                    c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP - INTERVAL %s', 
+                             (f"{LOBBY_COOLDOWN_MINUTES + 1} minutes",))
+                    conn.commit()
+                await ctx.send("✅ Cooldown reset!")
+            except Exception as e:
+                await ctx.send(f"❌ Erreur: {e}")
+            finally:
+                conn.close()
     
     @bot.command(name='clearlobbies')
     async def _clearlobbies(ctx):
-        await clear_lobbies_cmd(ctx)
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        from main import get_connection
+        conn = get_connection()
+        if conn:
+            try:
+                with conn.cursor() as c:
+                    c.execute('SELECT COUNT(*) as count FROM lobbies')
+                    count = c.fetchone()['count']
+                    c.execute('DELETE FROM lobbies')
+                    conn.commit()
+                await ctx.send(f"🗑️ {count} lobby(s) supprimé(s)")
+            except Exception as e:
+                await ctx.send(f"❌ Erreur: {e}")
+            finally:
+                conn.close()
     
     @bot.command(name='undo')
     async def _undo(ctx):
-        await undo_match_cmd(ctx)
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        from main import undo_last_match
+        success, result = undo_last_match()
+        if success:
+            message = f"🔄 **MATCH ANNULÉ!**\n"
+            message += f"Gagnants: {', '.join(result['winners'])}\n"
+            message += f"Perdants: {', '.join(result['losers'])}\n"
+            message += f"✅ Changements ELO inversés"
+            if result['had_dodge']:
+                message += f"\n🚨 Dodge annulé"
+        else:
+            message = f"❌ Erreur: {result}"
+        await ctx.send(message)
     
     @bot.command(name='addelo')
     async def _addelo(ctx, member: discord.Member = None, amount: int = None):
-        if member is None or amount is None:
-            message = "❌ Usage: !addelo @joueur montant"
-            await ctx.send(message, suppress_embeds=True)
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
             return
-        await add_elo_cmd(ctx, member, amount)
+        if not member or not amount or amount <= 0:
+            await ctx.send("❌ Usage: !addelo @joueur montant")
+            return
+        
+        from main import get_player, create_player, update_player_elo_only
+        player = get_player(member.id)
+        if not player:
+            create_player(member.id, member.display_name)
+            player = get_player(member.id)
+        
+        # Attribuer le rôle ping
+        await ensure_player_has_ping_role(ctx.guild, member.id)
+        
+        old_elo = player['elo']
+        new_elo = old_elo + amount
+        if update_player_elo_only(member.id, new_elo):
+            await ctx.send(f"✅ {member.display_name}: {old_elo} → {new_elo} (+{amount})")
+        else:
+            await ctx.send("❌ Erreur mise à jour ELO")
     
     @bot.command(name='removeelo')
     async def _removeelo(ctx, member: discord.Member = None, amount: int = None):
-        if member is None or amount is None:
-            message = "❌ Usage: !removeelo @joueur montant"
-            await ctx.send(message, suppress_embeds=True)
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
             return
-        await remove_elo_cmd(ctx, member, amount)
+        if not member or not amount or amount <= 0:
+            await ctx.send("❌ Usage: !removeelo @joueur montant")
+            return
+        
+        from main import get_player, create_player, update_player_elo_only
+        player = get_player(member.id)
+        if not player:
+            create_player(member.id, member.display_name)
+            player = get_player(member.id)
+        
+        # Attribuer le rôle ping
+        await ensure_player_has_ping_role(ctx.guild, member.id)
+        
+        old_elo = player['elo']
+        new_elo = max(0, old_elo - amount)
+        actual_removed = old_elo - new_elo
+        if update_player_elo_only(member.id, new_elo):
+            message = f"✅ {member.display_name}: {old_elo} → {new_elo} (-{actual_removed})"
+            if actual_removed < amount:
+                message += f" (min 0)"
+            await ctx.send(message)
+        else:
+            await ctx.send("❌ Erreur mise à jour ELO")
     
-    # Commande slash admin pour validation manuelle
-    @app_commands.command(name="result", description="Enregistrer manuellement un résultat de match (admin uniquement)")
+    # Commande admin pour attribuer manuellement tous les rôles
+    @bot.command(name='assignroles')
+    async def _assignroles(ctx):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        
+        assigned = await assign_ping_role_to_all_players(ctx.guild)
+        await ctx.send(f"🎯 {assigned} rôles ping attribués aux joueurs en base!")
+    
+    # Commande slash admin
+    @app_commands.command(name="result", description="Enregistrer un match manuellement (admin)")
     @app_commands.describe(
-        gagnant1="Premier joueur gagnant",
-        gagnant2="Deuxième joueur gagnant", 
-        gagnant3="Troisième joueur gagnant",
-        perdant1="Premier joueur perdant",
-        perdant2="Deuxième joueur perdant",
-        perdant3="Troisième joueur perdant",
-        dodge_joueur="Joueur qui a dodge (optionnel)",
-        score="Score final du match (optionnel)"
+        gagnant1="Premier gagnant", gagnant2="Deuxième gagnant", gagnant3="Troisième gagnant",
+        perdant1="Premier perdant", perdant2="Deuxième perdant", perdant3="Troisième perdant",
+        dodge_joueur="Joueur qui a dodge (optionnel)", score="Score du match (optionnel)"
     )
     @app_commands.default_permissions(administrator=True)
     @app_commands.choices(score=[
         app_commands.Choice(name="2-0", value="2-0"),
         app_commands.Choice(name="2-1", value="2-1")
     ])
-    async def _result_manual(
-        interaction: discord.Interaction,
-        gagnant1: discord.Member,
-        gagnant2: discord.Member,
-        gagnant3: discord.Member,
-        perdant1: discord.Member,
-        perdant2: discord.Member,
-        perdant3: discord.Member,
-        dodge_joueur: Optional[discord.Member] = None,
-        score: Optional[Literal["2-0", "2-1"]] = None
-    ):
-        await record_manual_match_result(
-            interaction, gagnant1, gagnant2, gagnant3, 
-            perdant1, perdant2, perdant3, dodge_joueur, score
-        )
+    async def _result_manual(interaction, gagnant1: discord.Member, gagnant2: discord.Member,
+                            gagnant3: discord.Member, perdant1: discord.Member, perdant2: discord.Member,
+                            perdant3: discord.Member, dodge_joueur: Optional[discord.Member] = None,
+                            score: Optional[Literal["2-0", "2-1"]] = None):
+        await record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
+                                       perdant1, perdant2, perdant3, dodge_joueur, score)
     
-    # Ajouter la commande slash au bot
     bot.tree.add_command(_result_manual)
     
-    # Event handler pour les réactions
+    # Event handler pour réactions d'annulation
     @bot.event
     async def on_raw_reaction_add(payload):
-        if payload.user_id == bot.user.id:  # Ignorer les réactions du bot
+        if payload.user_id == bot.user.id:
             return
         await handle_match_cancel_reaction(payload)
     
-    print("✅ Système de vote des joueurs activé avec auto-refresh")
-    print("✅ Toutes les commandes chargées depuis commands.py")
-    print(f"📊 Limite lobbies: {MAX_CONCURRENT_LOBBIES}")
-    print(f"⏰ Cooldown: {LOBBY_COOLDOWN_MINUTES} minutes")
-    print(f"🔔 Rôle ping: {PING_ROLE_ID}")
-    print(f"📺 Salon validation admin: {RESULT_CHANNEL_ID}")
-    print(f"📋 Salon résumés matchs: {MATCH_SUMMARY_CHANNEL_ID}")
-    print("🗳️ Vote des joueurs activé (majorité 4/6 ou unanimité)")
-    print("🔄 Auto-refresh des messages de vote toutes les 15 minutes")
-    print("↩️ Annulation par réaction activée")
+    print("✅ Commandes simplifiées chargées avec attribution automatique des rôles")
+    print("🎯 Attribution automatique du rôle ping à tous les joueurs")
+    print("🗳️ Système de vote avec auto-refresh activé")
     print("🚨 Système anti-dodge activé")
-    print("🔧 Commandes admin: !resetcd, !clearlobbies, !undo, /result, !addelo, !removeelo")
-        return
-    
-    # Vérifier/créer joueur
-    player = get_player(ctx.author.id)
-    if not player:
-        if not create_player(ctx.author.id, ctx.author.display_name):
-            message = "❌ Erreur: Impossible de créer votre profil"
-            await ctx.send(message, suppress_embeds=True)
-            return
-    
-    # Créer le lobby avec vérifications
-    lobby_id, creation_msg = create_lobby(room_code.upper())
-    if not lobby_id:
-        message = f"❌ Erreur: {creation_msg}"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Ajouter le créateur au lobby
-    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
-    
-    if success:
-        # Ping du rôle + message de création
-        role_mention = f"<@&{PING_ROLE_ID}>"
-        message = (f"{role_mention}\n\n"
-                  f"🎮 NOUVEAU LOBBY!\n"
-                  f"Lobby #{lobby_id}\n"
-                  f"Code: {room_code.upper()}\n"
-                  f"Créateur: {ctx.author.display_name}\n"
-                  f"Joueurs: 1/6\n"
-                  f"Rejoindre: !join {lobby_id}\n\n"
-                  f"📊 Lobbies actifs: {len(get_all_lobbies())}/{MAX_CONCURRENT_LOBBIES}")
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def join_lobby_cmd(ctx, lobby_id: int = None):
-    """!join <id> - Rejoindre un lobby"""
-    from main import (
-        get_player, create_player, add_player_to_lobby, get_lobby,
-        create_random_teams, select_random_maps, get_connection
-    )
-    
-    if lobby_id is None:
-        message = "❌ Usage: !join <id_lobby>"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Vérifier/créer joueur
-    player = get_player(ctx.author.id)
-    if not player:
-        if not create_player(ctx.author.id, ctx.author.display_name):
-            message = "❌ Erreur: Impossible de créer votre profil"
-            await ctx.send(message, suppress_embeds=True)
-            return
-    
-    # Rejoindre le lobby
-    success, msg = add_player_to_lobby(lobby_id, ctx.author.id)
-    
-    if success:
-        # Récupérer info lobby
-        lobby = get_lobby(lobby_id)
-        if lobby:
-            players_list = lobby['players'].split(',') if lobby['players'] else []
-            players_count = len(players_list)
-            
-            if players_count >= 6:
-                # Créer les équipes aléatoires
-                team1_ids, team2_ids = create_random_teams([int(id) for id in players_list])
-                
-                # Récupérer les noms des joueurs et créer les mentions
-                team1_mentions = []
-                team2_mentions = []
-                
-                for player_id in team1_ids:
-                    player = get_player(player_id)
-                    if player:
-                        team1_mentions.append(f"<@{player_id}>")
-                
-                for player_id in team2_ids:
-                    player = get_player(player_id)
-                    if player:
-                        team2_mentions.append(f"<@{player_id}>")
-                
-                # Sélectionner 3 maps aléatoires
-                selected_maps = select_random_maps(3)
-                
-                team1_text = '\n'.join([f"• {mention}" for mention in team1_mentions])
-                team2_text = '\n'.join([f"• {mention}" for mention in team2_mentions])
-                maps_text = '\n'.join([f"• {map_name}" for map_name in selected_maps])
-                
-                # Créer le lien cliquable
-                room_link = f"https://link.nulls.gg/nb/invite/gameroom/fr?tag={lobby['room_code']}"
-                
-                # MESSAGE UNIQUE: Confirmation simple dans le salon des joueurs
-                confirmation_message = f"🚀 **MATCH LANCÉ!**\nLobby #{lobby_id} - Code: {lobby['room_code']}\n✅ Équipes créées et envoyées dans le salon de vote!"
-                await ctx.send(confirmation_message, suppress_embeds=True)
-                
-                # MESSAGE DE VOTE: Dans le salon admin avec tous les détails
-                vote_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
-                if vote_channel:
-                    vote_message = (f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{lobby_id}\n"
-                                   f"Code: {lobby['room_code']}\n\n"
-                                   f"🔵 **Équipe Bleue:**\n{team1_text}\n\n"
-                                   f"🔴 **Équipe Rouge:**\n{team2_text}\n\n"
-                                   f"🗺️ **Maps:**\n{maps_text}\n\n"
-                                   f"🎮 **Lien room:** {room_link}\n\n"
-                                   f"📊 Total votes: 0/6\n"
-                                   f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
-                                   f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
-                                   f"🔄 Message auto-refresh toutes les 15 minutes")
-                    
-                    vote_view = PlayerVoteView(team1_ids, team2_ids, lobby_id, lobby['room_code'], ctx.guild)
-                    vote_msg = await vote_channel.send(vote_message, view=vote_view, suppress_embeds=True)
-                    
-                    # Démarrer le refresh automatique
-                    vote_view.current_message = vote_msg
-                    await vote_view.start_refresh_task()
-                
-                # Supprimer le lobby maintenant qu'il est lancé
-                conn = get_connection()
-                if conn:
-                    try:
-                        with conn.cursor() as c:
-                            c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
-                            conn.commit()
-                    finally:
-                        conn.close()
-            else:
-                message = (f"✅ LOBBY REJOINT!\n"
-                          f"{msg}\n"
-                          f"Lobby: #{lobby_id}\n"
-                          f"Code: {lobby['room_code']}\n"
-                          f"Joueurs: {players_count}/6")
-                await ctx.send(message, suppress_embeds=True)
-        else:
-            message = f"✅ Rejoint: {msg}"
-            await ctx.send(message, suppress_embeds=True)
-    else:
-        message = f"❌ Erreur: {msg}"
-        await ctx.send(message, suppress_embeds=True)
-
-async def leave_lobby_cmd(ctx):
-    """!leave - Quitter votre lobby"""
-    from main import remove_player_from_lobby
-    
-    success, msg = remove_player_from_lobby(ctx.author.id)
-    
-    if success:
-        message = f"👋 Quitté: {msg}"
-    else:
-        message = f"❌ Erreur: {msg}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def list_lobbies_cmd(ctx):
-    """!lobbies - Liste des lobbies actifs"""
-    from main import (
-        get_all_lobbies, get_cooldown_info, MAX_CONCURRENT_LOBBIES
-    )
-    
-    lobbies = get_all_lobbies()
-    cooldown_info = get_cooldown_info()
-    
-    message = f"🎮 LOBBIES ACTIFS ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES}):\n\n"
-    
-    if not lobbies:
-        message += "📋 Aucun lobby actif\n"
-    else:
-        for lobby in lobbies:
-            lobby_id = lobby['id']
-            room_code = lobby['room_code']
-            players_str = lobby['players']
-            players_count = len(players_str.split(',')) if players_str else 0
-            
-            status = "🟢" if players_count < 6 else "🔴"
-            message += f"{status} Lobby #{lobby_id}\n"
-            message += f"Code: {room_code}\n"
-            message += f"Joueurs: {players_count}/6\n\n"
-    
-    # Afficher le cooldown si actif
-    if cooldown_info and cooldown_info.get('active'):
-        minutes = cooldown_info['remaining_minutes']
-        seconds = cooldown_info['remaining_seconds']
-        message += f"⏰ Cooldown: {minutes}m {seconds}s restantes\n"
-    else:
-        message += "✅ Nouveau lobby possible\n"
-    
-    message += f"Créer: !create <code>"
-    await ctx.send(message, suppress_embeds=True)
-
-async def show_elo_cmd(ctx):
-    """!elo - Voir son ELO et rang"""
-    from main import get_player, get_leaderboard, get_player_dodge_count
-    
-    player = get_player(ctx.author.id)
-    
-    if not player:
-        message = ("❌ NON INSCRIT\n"
-                  "Utilisez !create <code> ou !join <id> pour vous inscrire automatiquement")
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    # Récupérer le pseudo Discord actuel
-    try:
-        member = ctx.guild.get_member(int(player['discord_id']))
-        display_name = member.display_name if member else player['name']
-    except:
-        display_name = player['name']
-    
-    elo = player['elo']
-    wins = player['wins']
-    losses = player['losses']
-    dodge_count = get_player_dodge_count(ctx.author.id)
-    
-    total_games = wins + losses
-    winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
-    
-    # Calculer le rang
-    players = get_leaderboard()
-    rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), len(players))
-    
-    message = (f"📊 {display_name}\n"
-              f"ELO: {elo} points\n"
-              f"Rang: #{rank}/{len(players)}\n"
-              f"Victoires: {wins}\n"
-              f"Défaites: {losses}\n"
-              f"Winrate: {winrate}%")
-    
-    if dodge_count > 0:
-        message += f"\n🚨 Dodges: {dodge_count}"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def leaderboard_cmd(ctx):
-    """!leaderboard - Classement des joueurs"""
-    from main import get_leaderboard, get_player
-    
-    players = get_leaderboard()
-    
-    if not players:
-        message = "📊 CLASSEMENT VIDE\nAucun joueur inscrit"
-        await ctx.send(message, suppress_embeds=True)
-        return
-    
-    message = "🏆 CLASSEMENT ELO\n\n"
-    
-    for i, player in enumerate(players[:10], 1):
-        # Récupérer le membre Discord actuel pour avoir le pseudo à jour
-        try:
-            member = ctx.guild.get_member(int(player['discord_id']))
-            display_name = member.display_name if member else player['name']
-        except:
-            display_name = player['name']
-        
-        elo = player['elo']
-        wins = player['wins']
-        losses = player['losses']
-        
-        total_games = wins + losses
-        winrate = round(wins / total_games * 100, 1) if total_games > 0 else 0
-        
-        if i == 1:
-            emoji = "🥇"
-        elif i == 2:
-            emoji = "🥈"
-        elif i == 3:
-            emoji = "🥉"
-        else:
-            emoji = f"{i}."
-        
-        message += f"{emoji} {display_name} - {elo} ELO ({winrate}%)\n"
-    
-    message += f"\n{len(players)} joueur(s) total"
-    
-    # Position du joueur actuel
-    current_player = get_player(ctx.author.id)
-    if current_player:
-        current_pos = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(ctx.author.id)), None)
-        if current_pos:
-            message += f"\n\nVotre position: #{current_pos} - {current_player['elo']} ELO"
-    
-    await ctx.send(message, suppress_embeds=True)
-
-async def lobby_status_cmd(ctx):
-    """!status - Statut des lobbies et cooldown"""
-    from main import (
-        get_all_lobbies, get_cooldown_info, get_leaderboard,
-        MAX_CONCURRENT_LOBBIES, LOBBY_COOLDOWN_MINUTES
-    )
-    
-    lobbies = get_all_lobbies()
-    cooldown_info = get_cooldown_info()
-    
-    message = f"📊 STATUT SYSTÈME\n\n"
-    message += f"🎮 Lobbies: {len(lobbies)}/{MAX_CONCURRENT_LOBBIES}\n"
-    
-    if cooldown_info and cooldown_info.get('active'):
-        minutes = cooldown_info['remaining_minutes']
-        seconds = cooldown_info['remaining_seconds']
-        message += f"⏰ Cooldown: {minutes}m {seconds}s\n"
-    else:
-        message += f"✅ Création possible\n"
-    
-    message += f"⏱️ Cooldown: {LOBBY_COOLDOWN_MINUTES} min\n"
-    
-    # Statistiques des joueurs
-    players = get_leaderboard()
-    message += f"👥 Joueurs inscrits: {len(players)}"
-    
-    await ctx.send(message, suppress_embeds=True)
+    print("↩️ Annulation par réaction activée")
+    print(f"📺 Salon admin: {RESULT_CHANNEL_ID}")
+    print(f"📋 Salon résumés: {MATCH_SUMMARY_CHANNEL_ID}")
+    print("🔧 Commande admin: !assignroles pour attribuer tous les rôles manuellement")
