@@ -68,6 +68,7 @@ class PlayerVoteView(discord.ui.View):
         self.all_player_ids = set(team1_ids + team2_ids)
         self.dodge_reports = {}  # {user_id: reported_player_id}
         self.dodge_confirmed = None  # ID du joueur confirmé comme ayant dodge
+        self.original_message = None  # Référence au message original pour mise à jour
     
     @discord.ui.button(label='🔵 Victoire Équipe Bleue', style=discord.ButtonStyle.primary, emoji='🔵')
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -471,7 +472,115 @@ class PlayerVoteView(discord.ui.View):
             except:
                 pass
     
-    async def validate_match_result(self, interaction, team1_wins, reason):
+    async def validate_match_result(self, team1_wins, reason):
+        """Valide automatiquement le résultat du match"""
+        try:
+            from main import (
+                get_player, update_player_elo, calculate_elo_change,
+                get_connection, save_match_history
+            )
+            
+            # Marquer comme validé
+            self.match_validated = True
+            
+            # Déterminer gagnants et perdants
+            if team1_wins:
+                winner_ids = self.team1_ids
+                loser_ids = self.team2_ids
+                winning_team = "Bleue"
+                winning_color = "🔵"
+            else:
+                winner_ids = self.team2_ids
+                loser_ids = self.team1_ids
+                winning_team = "Rouge"
+                winning_color = "🔴"
+            
+            # Récupérer les joueurs
+            winners = []
+            losers = []
+            winner_elos = []
+            loser_elos = []
+            
+            for player_id in winner_ids:
+                player = get_player(player_id)
+                if player:
+                    winners.append(player)
+                    winner_elos.append(player['elo'])
+            
+            for player_id in loser_ids:
+                player = get_player(player_id)
+                if player:
+                    losers.append(player)
+                    loser_elos.append(player['elo'])
+            
+            if len(winners) != 3 or len(losers) != 3:
+                await self.update_vote_message_status("❌ Erreur: Impossible de récupérer tous les joueurs")
+                return
+            
+            # Calculer les changements d'ELO
+            winner_avg = sum(winner_elos) / 3
+            loser_avg = sum(loser_elos) / 3
+            
+            winner_elo_changes = []
+            loser_elo_changes = []
+            
+            # Appliquer les changements
+            for i, player in enumerate(winners):
+                old_elo = winner_elos[i]
+                elo_change = calculate_elo_change(old_elo, loser_avg, True)
+                new_elo = max(0, old_elo + elo_change)
+                
+                if update_player_elo(player['discord_id'], new_elo, True):
+                    winner_elo_changes.append(elo_change)
+                else:
+                    await self.update_vote_message_status("❌ Erreur lors de la mise à jour des ELO")
+                    return
+            
+            for i, player in enumerate(losers):
+                old_elo = loser_elos[i]
+                elo_change = calculate_elo_change(old_elo, winner_avg, False)
+                new_elo = max(0, old_elo + elo_change)
+                
+                if update_player_elo(player['discord_id'], new_elo, False):
+                    loser_elo_changes.append(elo_change)
+                else:
+                    await self.update_vote_message_status("❌ Erreur lors de la mise à jour des ELO")
+                    return
+            
+            # Désactiver tous les boutons
+            for item in self.children:
+                item.disabled = True
+            
+            # Message de validation
+            validation_message = f"✅ **MATCH VALIDÉ PAR VOTE** ({reason})\n\n"
+            validation_message += f"🏆 VICTOIRE ÉQUIPE {winning_team} {winning_color}\n"
+            validation_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}"
+            
+            # Mettre à jour le message de vote
+            await self.update_vote_message_status("✅ **MATCH VALIDÉ** - Calcul des ELO en cours...")
+            
+            # Créer des objets mock pour la sauvegarde
+            class MockMember:
+                def __init__(self, discord_id, name):
+                    self.id = int(discord_id)
+                    self.display_name = name
+            
+            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
+            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
+            
+            # Sauvegarder pour l'historique (undo)
+            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes)
+            
+            # Envoyer le résumé dans le salon dédié avec réaction d'annulation
+            await self.send_match_summary(winners, losers, winner_elos, loser_elos, 
+                                        winner_elo_changes, loser_elo_changes, winner_avg, loser_avg, reason)
+            
+            # Mise à jour finale du message de vote
+            await self.update_vote_message_status(validation_message)
+            
+        except Exception as e:
+            print(f"Erreur dans validate_match_result: {e}")
+            await self.update_vote_message_status(f"❌ Erreur lors de la validation: {str(e)}")
         """Valide automatiquement le résultat du match"""
         try:
             from main import (
@@ -803,10 +912,15 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
                               f"🔴 **Équipe Rouge:**\n{team2_text}\n\n"
                               f"🗺️ **Maps:**\n{maps_text}\n\n"
                               f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
-                              f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes")
+                              f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
+                              f"⏰ Vous avez 24h pour voter")
                 
                 vote_view = PlayerVoteView(team1_ids, team2_ids, lobby_id, lobby['room_code'])
-                await ctx.send(vote_message, view=vote_view, suppress_embeds=True)
+                # Envoyer directement via ctx.send au lieu d'une interaction
+                vote_msg = await ctx.send(vote_message, view=vote_view, suppress_embeds=True)
+                
+                # Sauvegarder la référence du message pour les mises à jour
+                await vote_view.set_original_message(vote_msg)
                 
                 # Envoyer aussi dans le salon admin pour backup
                 admin_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
