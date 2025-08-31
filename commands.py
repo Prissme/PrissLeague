@@ -36,14 +36,17 @@ class DodgeReportSelect(discord.ui.Select):
             # Traiter le signalement
             await self.vote_view.process_dodge_report(self.reporter_id, reported_player_id)
             
-            await interaction.response.send_message(
+            # Réponse sécurisée
+            await self.vote_view.safe_respond(
+                interaction,
                 f"✅ Signalement enregistré pour <@{reported_player_id}>",
                 ephemeral=True
             )
             
         except Exception as e:
             print(f"Erreur dans DodgeReportSelect callback: {e}")
-            await interaction.response.send_message(
+            await self.vote_view.safe_respond(
+                interaction,
                 "❌ Erreur lors du signalement",
                 ephemeral=True
             )
@@ -87,12 +90,12 @@ class PlayerVoteView(discord.ui.View):
         try:
             # Vérifier que c'est un joueur du match
             if interaction.user.id not in self.all_player_ids:
-                await interaction.response.send_message("❌ Seuls les joueurs du match peuvent signaler un dodge!", ephemeral=True)
+                await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent signaler un dodge!", ephemeral=True)
                 return
             
             # Vérifier que le match n'a pas déjà été validé
             if self.match_validated:
-                await interaction.response.send_message("❌ Ce match a déjà été validé!", ephemeral=True)
+                await self.safe_respond(interaction, "❌ Ce match a déjà été validé!", ephemeral=True)
                 return
             
             # Créer une liste de sélection avec tous les joueurs du match
@@ -106,7 +109,7 @@ class PlayerVoteView(discord.ui.View):
                     ))
             
             if not options:
-                await interaction.response.send_message("❌ Aucun autre joueur à signaler", ephemeral=True)
+                await self.safe_respond(interaction, "❌ Aucun autre joueur à signaler", ephemeral=True)
                 return
             
             # Créer le menu de sélection
@@ -114,14 +117,10 @@ class PlayerVoteView(discord.ui.View):
             view = discord.ui.View(timeout=300)  # 5 minutes pour sélectionner
             view.add_item(select)
             
-            await interaction.response.send_message("🚨 Sélectionnez le joueur qui a dodge:", view=view, ephemeral=True)
+            await self.safe_respond(interaction, "🚨 Sélectionnez le joueur qui a dodge:", view=view, ephemeral=True)
             
         except Exception as e:
             print(f"Erreur dans handle_dodge_report: {e}")
-            try:
-                await interaction.response.send_message(f"❌ Erreur lors du signalement: {str(e)}", ephemeral=True)
-            except:
-                pass
     
     async def process_dodge_report(self, reporter_id, reported_player_id):
         """Traite un signalement de dodge"""
@@ -900,37 +899,30 @@ async def join_lobby_cmd(ctx, lobby_id: int = None):
                           f"🔵 Équipe 1:\n{team1_text}\n\n"
                           f"🔴 Équipe 2:\n{team2_text}\n\n"
                           f"🗺️ Maps:\n{maps_text}\n\n"
-                          f"🎮 Rejoindre la room: {room_link}")
+                          f"🎮 Rejoindre la room: {room_link}\n\n"
+                          f"📊 Le vote pour le résultat se fera dans le salon de validation après le match.")
                 
-                # Envoyer le message principal
+                # Envoyer SEULEMENT le message d'info dans le salon des joueurs (sans vote)
                 await ctx.send(message, suppress_embeds=True)
                 
-                # Envoyer le système de vote dans le même salon
-                vote_message = (f"🗳️ **VOTE DU RÉSULTAT**\n"
-                              f"Lobby #{lobby_id} - Code: {lobby['room_code']}\n\n"
-                              f"🔵 **Équipe Bleue:**\n{team1_text}\n\n"
-                              f"🔴 **Équipe Rouge:**\n{team2_text}\n\n"
-                              f"🗺️ **Maps:**\n{maps_text}\n\n"
-                              f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
-                              f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
-                              f"⏰ Vous avez 24h pour voter")
-                
-                vote_view = PlayerVoteView(team1_ids, team2_ids, lobby_id, lobby['room_code'])
-                # Envoyer directement via ctx.send au lieu d'une interaction
-                vote_msg = await ctx.send(vote_message, view=vote_view, suppress_embeds=True)
-                
-                # Sauvegarder la référence du message pour les mises à jour
-                await vote_view.set_original_message(vote_msg)
-                
-                # Envoyer aussi dans le salon admin pour backup
-                admin_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
-                if admin_channel:
-                    admin_message = (f"🔧 **BACKUP ADMIN** - Lobby #{lobby_id}\n"
-                                   f"Vote des joueurs en cours dans {ctx.channel.mention}\n"
-                                   f"Utilisez ces boutons en cas d'égalité ou de problème:")
+                # Envoyer le SEUL message avec vote dans le salon de validation
+                vote_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
+                if vote_channel:
+                    vote_message = (f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{lobby_id}\n"
+                                  f"Code: {lobby['room_code']}\n\n"
+                                  f"🔵 **Équipe Bleue:**\n{team1_text}\n\n"
+                                  f"🔴 **Équipe Rouge:**\n{team2_text}\n\n"
+                                  f"🗺️ **Maps:**\n{maps_text}\n\n"
+                                  f"🎮 **Lien room:** {room_link}\n\n"
+                                  f"⚡ Joueurs: Cliquez sur le bouton de votre équipe gagnante!\n"
+                                  f"📊 Majorité nécessaire: 4/6 votes ou unanimité après 6 votes\n"
+                                  f"⏰ Vous avez 24h pour voter")
                     
-                    admin_view = AdminMatchResultView(team1_ids, team2_ids, lobby_id, lobby['room_code'])
-                    await admin_channel.send(admin_message, view=admin_view, suppress_embeds=True)
+                    vote_view = PlayerVoteView(team1_ids, team2_ids, lobby_id, lobby['room_code'])
+                    vote_msg = await vote_channel.send(vote_message, view=vote_view, suppress_embeds=True)
+                    
+                    # Sauvegarder la référence du message pour les mises à jour
+                    await vote_view.set_original_message(vote_msg)
                 
                 # Supprimer le lobby maintenant qu'il est lancé
                 conn = get_connection()
