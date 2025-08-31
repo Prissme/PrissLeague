@@ -18,6 +18,37 @@ RESULT_CHANNEL_ID = 1408595087331430520
 MATCH_SUMMARY_CHANNEL_ID = 1385919316569886732
 
 # ================================
+# CLASSE POUR SÉLECTION DE DODGE
+# ================================
+
+class DodgeReportSelect(discord.ui.Select):
+    """Menu de sélection pour signaler un joueur qui a dodge"""
+    
+    def __init__(self, options, vote_view, reporter_id):
+        super().__init__(placeholder="Choisir le joueur qui a dodge...", options=options, min_values=1, max_values=1)
+        self.vote_view = vote_view
+        self.reporter_id = reporter_id
+    
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            reported_player_id = int(self.values[0])
+            
+            # Traiter le signalement
+            await self.vote_view.process_dodge_report(self.reporter_id, reported_player_id)
+            
+            await interaction.response.send_message(
+                f"✅ Signalement enregistré pour <@{reported_player_id}>",
+                ephemeral=True
+            )
+            
+        except Exception as e:
+            print(f"Erreur dans DodgeReportSelect callback: {e}")
+            await interaction.response.send_message(
+                "❌ Erreur lors du signalement",
+                ephemeral=True
+            )
+
+# ================================
 # CLASSES POUR LES BOUTONS DE VOTE
 # ================================
 
@@ -25,7 +56,7 @@ class PlayerVoteView(discord.ui.View):
     """Vue avec boutons pour que les joueurs votent le résultat d'un match"""
     
     def __init__(self, team1_ids, team2_ids, lobby_id, room_code):
-        super().__init__(timeout=600)  # 10 minutes de timeout
+        super().__init__(timeout=86400)  # 24 heures de timeout
         self.team1_ids = team1_ids  # Équipe bleue
         self.team2_ids = team2_ids  # Équipe rouge
         self.lobby_id = lobby_id
@@ -35,6 +66,8 @@ class PlayerVoteView(discord.ui.View):
         self.voters = set()  # Tous les joueurs qui ont voté
         self.match_validated = False
         self.all_player_ids = set(team1_ids + team2_ids)
+        self.dodge_reports = {}  # {user_id: reported_player_id}
+        self.dodge_confirmed = None  # ID du joueur confirmé comme ayant dodge
     
     @discord.ui.button(label='🔵 Victoire Équipe Bleue', style=discord.ButtonStyle.primary, emoji='🔵')
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -44,7 +77,307 @@ class PlayerVoteView(discord.ui.View):
     async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_vote(interaction, team1_wins=False)
     
-    async def handle_vote(self, interaction: discord.Interaction, team1_wins: bool):
+    @discord.ui.button(label='🚨 Signaler un Dodge', style=discord.ButtonStyle.secondary, emoji='🚨')
+    async def report_dodge(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_dodge_report(interaction)
+    
+    async def handle_dodge_report(self, interaction: discord.Interaction):
+        """Gère le signalement d'un dodge"""
+        try:
+            # Vérifier que c'est un joueur du match
+            if interaction.user.id not in self.all_player_ids:
+                await interaction.response.send_message("❌ Seuls les joueurs du match peuvent signaler un dodge!", ephemeral=True)
+                return
+            
+            # Vérifier que le match n'a pas déjà été validé
+            if self.match_validated:
+                await interaction.response.send_message("❌ Ce match a déjà été validé!", ephemeral=True)
+                return
+            
+            # Créer une liste de sélection avec tous les joueurs du match
+            options = []
+            for player_id in self.all_player_ids:
+                if player_id != interaction.user.id:  # Ne pas inclure soi-même
+                    options.append(discord.SelectOption(
+                        label=f"Joueur {player_id}",
+                        value=str(player_id),
+                        description="Signaler ce joueur pour dodge"
+                    ))
+            
+            if not options:
+                await interaction.response.send_message("❌ Aucun autre joueur à signaler", ephemeral=True)
+                return
+            
+            # Créer le menu de sélection
+            select = DodgeReportSelect(options, self, interaction.user.id)
+            view = discord.ui.View(timeout=300)  # 5 minutes pour sélectionner
+            view.add_item(select)
+            
+            await interaction.response.send_message("🚨 Sélectionnez le joueur qui a dodge:", view=view, ephemeral=True)
+            
+        except Exception as e:
+            print(f"Erreur dans handle_dodge_report: {e}")
+            try:
+                await interaction.response.send_message(f"❌ Erreur lors du signalement: {str(e)}", ephemeral=True)
+            except:
+                pass
+    
+    async def process_dodge_report(self, reporter_id, reported_player_id):
+        """Traite un signalement de dodge"""
+        try:
+            # Enregistrer le signalement
+            self.dodge_reports[reporter_id] = int(reported_player_id)
+            
+            # Compter les signalements pour chaque joueur
+            report_counts = {}
+            for reported_id in self.dodge_reports.values():
+                report_counts[reported_id] = report_counts.get(reported_id, 0) + 1
+            
+            # Vérifier si un joueur a assez de signalements (majorité = 3+ signalements)
+            for player_id, count in report_counts.items():
+                if count >= 3:  # Majorité de 3/5 autres joueurs (celui signalé ne peut pas voter contre lui-même)
+                    self.dodge_confirmed = player_id
+                    await self.handle_confirmed_dodge()
+                    return
+            
+            # Pas encore de majorité, mettre à jour le statut
+            await self.update_vote_message_with_dodge_info()
+            
+        except Exception as e:
+            print(f"Erreur dans process_dodge_report: {e}")
+    
+    async def handle_confirmed_dodge(self):
+        """Gère la confirmation d'un dodge par majorité"""
+        try:
+            from main import record_dodge, get_player_dodge_count, calculate_dodge_penalty
+            
+            # Enregistrer le dodge
+            record_dodge(self.dodge_confirmed)
+            dodge_penalty = calculate_dodge_penalty(get_player_dodge_count(self.dodge_confirmed))
+            
+            # Déterminer dans quelle équipe était le joueur qui a dodge
+            dodge_in_team1 = self.dodge_confirmed in self.team1_ids
+            
+            if dodge_in_team1:
+                # Le dodge était dans l'équipe 1, l'équipe 2 gagne automatiquement
+                await self.validate_match_with_dodge(team1_wins=False, dodge_player_id=self.dodge_confirmed, dodge_penalty=dodge_penalty)
+            else:
+                # Le dodge était dans l'équipe 2, l'équipe 1 gagne automatiquement
+                await self.validate_match_with_dodge(team1_wins=True, dodge_player_id=self.dodge_confirmed, dodge_penalty=dodge_penalty)
+                
+        except Exception as e:
+            print(f"Erreur dans handle_confirmed_dodge: {e}")
+    
+    async def update_vote_message_with_dodge_info(self):
+        """Met à jour le message de vote avec les infos de dodge"""
+        try:
+            # Compter les votes actuels
+            total_votes_team1 = len(self.votes_team1)
+            total_votes_team2 = len(self.votes_team2)
+            total_votes = total_votes_team1 + total_votes_team2
+            
+            # Construire le message avec les informations de dodge
+            status_message = f"🗳️ **VOTE EN COURS** - Lobby #{self.lobby_id}\n\n"
+            
+            # Votes normaux
+            team1_voters = [f"<@{pid}>" for pid in self.votes_team1]
+            team2_voters = [f"<@{pid}>" for pid in self.votes_team2]
+            
+            status_message += f"🔵 **Équipe Bleue** ({total_votes_team1} votes):\n"
+            if team1_voters:
+                status_message += f"Votants: {', '.join(team1_voters)}\n"
+            
+            status_message += f"\n🔴 **Équipe Rouge** ({total_votes_team2} votes):\n"
+            if team2_voters:
+                status_message += f"Votants: {', '.join(team2_voters)}\n"
+            
+            status_message += f"\n📊 Total votes: {total_votes}/6\n"
+            
+            # Informations sur les signalements de dodge
+            if self.dodge_reports:
+                report_counts = {}
+                for reported_id in self.dodge_reports.values():
+                    report_counts[reported_id] = report_counts.get(reported_id, 0) + 1
+                
+                status_message += f"\n🚨 **SIGNALEMENTS DE DODGE:**\n"
+                for player_id, count in report_counts.items():
+                    status_message += f"<@{player_id}>: {count} signalement(s)\n"
+                
+                status_message += f"(Majorité de 3 signalements = dodge confirmé)\n"
+            
+            remaining = 6 - total_votes
+            if remaining > 0:
+                status_message += f"\n⏳ En attente de {remaining} vote(s) supplémentaire(s)"
+            
+            # Essayer de mettre à jour le message original
+            # Note: Cette partie nécessiterait une référence au message original
+            
+        except Exception as e:
+            print(f"Erreur dans update_vote_message_with_dodge_info: {e}")
+    
+    async def validate_match_with_dodge(self, team1_wins, dodge_player_id, dodge_penalty):
+        """Valide le match avec gestion du dodge"""
+        try:
+            from main import (
+                get_player, update_player_elo, calculate_elo_change,
+                save_match_history
+            )
+            
+            # Marquer comme validé
+            self.match_validated = True
+            
+            # Déterminer gagnants et perdants
+            if team1_wins:
+                winner_ids = self.team1_ids
+                loser_ids = self.team2_ids
+                winning_team = "Bleue"
+                winning_color = "🔵"
+                reason = "dodge adverse confirmé"
+            else:
+                winner_ids = self.team2_ids
+                loser_ids = self.team1_ids
+                winning_team = "Rouge"
+                winning_color = "🔴"
+                reason = "dodge adverse confirmé"
+            
+            # Récupérer les joueurs
+            winners = []
+            losers = []
+            winner_elos = []
+            loser_elos = []
+            
+            for player_id in winner_ids:
+                player = get_player(player_id)
+                if player:
+                    winners.append(player)
+                    winner_elos.append(player['elo'])
+            
+            for player_id in loser_ids:
+                player = get_player(player_id)
+                if player:
+                    losers.append(player)
+                    loser_elos.append(player['elo'])
+            
+            if len(winners) != 3 or len(losers) != 3:
+                return
+            
+            # Calculer les changements d'ELO avec gestion du dodge
+            winner_avg = sum(winner_elos) / 3
+            loser_avg = sum(loser_elos) / 3
+            
+            winner_elo_changes = []
+            loser_elo_changes = []
+            
+            # Appliquer les changements pour les gagnants (réduction car dodge)
+            for i, player in enumerate(winners):
+                old_elo = winner_elos[i]
+                base_change = calculate_elo_change(old_elo, loser_avg, True)
+                # Réduction de 20% car victoire par dodge
+                elo_change = int(base_change * 0.8)
+                new_elo = max(0, old_elo + elo_change)
+                
+                if update_player_elo(player['discord_id'], new_elo, True):
+                    winner_elo_changes.append(elo_change)
+            
+            # Appliquer les changements pour les perdants
+            for i, player in enumerate(losers):
+                old_elo = loser_elos[i]
+                base_change = calculate_elo_change(old_elo, winner_avg, False)
+                
+                if int(player['discord_id']) == dodge_player_id:
+                    # Le joueur qui a dodge perd plus
+                    final_change = base_change - dodge_penalty
+                    new_elo = max(0, old_elo + final_change)
+                    if update_player_elo(player['discord_id'], new_elo, False):
+                        loser_elo_changes.append(final_change)
+                else:
+                    # Ses coéquipiers perdent moins (protection)
+                    protected_change = int(base_change * 0.3)  # Seulement 30% de la perte
+                    new_elo = max(0, old_elo + protected_change)
+                    if update_player_elo(player['discord_id'], new_elo, False):
+                        loser_elo_changes.append(protected_change)
+            
+            # Désactiver tous les boutons
+            for item in self.children:
+                item.disabled = True
+            
+            # Créer des objets mock pour la sauvegarde
+            class MockMember:
+                def __init__(self, discord_id, name):
+                    self.id = int(discord_id)
+                    self.display_name = name
+            
+            mock_winners = [MockMember(p['discord_id'], p['name']) for p in winners]
+            mock_losers = [MockMember(p['discord_id'], p['name']) for p in losers]
+            
+            # Sauvegarder pour l'historique (undo)
+            save_match_history(mock_winners, mock_losers, winner_elo_changes, loser_elo_changes, dodge_player_id)
+            
+            # Envoyer le résumé avec informations de dodge
+            await self.send_match_summary_with_dodge(
+                mock_winners, mock_losers, winner_elos, loser_elos,
+                winner_elo_changes, loser_elo_changes, winner_avg, loser_avg,
+                reason, dodge_player_id, dodge_penalty
+            )
+            
+        except Exception as e:
+            print(f"Erreur dans validate_match_with_dodge: {e}")
+    
+    async def send_match_summary_with_dodge(self, winners, losers, winner_elos, loser_elos,
+                                           winner_elo_changes, loser_elo_changes, winner_avg, loser_avg,
+                                           reason, dodge_player_id, dodge_penalty):
+        """Envoie le résumé du match avec informations de dodge"""
+        try:
+            from main import save_match_message_id
+            
+            # Construire le message de résultat
+            winning_team = "Bleue" if winners[0].id in self.team1_ids else "Rouge"
+            winning_color = "🔵" if winning_team == "Bleue" else "🔴"
+            losing_color = "🔴" if winning_team == "Bleue" else "🔵"
+            
+            result_message = f"🏆 **RÉSULTAT DE MATCH**\n\n"
+            result_message += f"**Victoire Équipe {winning_team} {winning_color}** (par {reason})\n"
+            result_message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
+            
+            result_message += f"🚨 **DODGE CONFIRMÉ:** <@{dodge_player_id}> (-{dodge_penalty} ELO supplémentaire)\n\n"
+            
+            result_message += f"{winning_color} **GAGNANTS:**\n"
+            for i, member in enumerate(winners):
+                old_elo = winner_elos[i]
+                change = winner_elo_changes[i]
+                new_elo = old_elo + change
+                result_message += f"<@{member.id}>: {old_elo} → {new_elo} (+{change}) [Victoire par dodge]\n"
+            
+            result_message += f"\n{losing_color} **PERDANTS:**\n"
+            for i, member in enumerate(losers):
+                old_elo = loser_elos[i]
+                change = loser_elo_changes[i]
+                new_elo = old_elo + change
+                
+                if member.id == dodge_player_id:
+                    result_message += f"🚨 <@{member.id}>: {old_elo} → {new_elo} ({change:+}) [DODGE]\n"
+                else:
+                    result_message += f"<@{member.id}>: {old_elo} → {new_elo} ({change:+}) [Protégé]\n"
+            
+            # Statistiques
+            elo_diff = abs(winner_avg - loser_avg)
+            result_message += f"\n📊 **ANALYSE:**\n"
+            result_message += f"ELO moyen gagnants: {round(winner_avg)}\n"
+            result_message += f"ELO moyen perdants: {round(loser_avg)}\n"
+            result_message += f"Écart: {round(elo_diff)} points\n\n"
+            
+            result_message += f"⚠️ **SYSTÈME ANTI-DODGE:**\n"
+            result_message += f"• Pénalité dodge: -{dodge_penalty} ELO\n"
+            result_message += f"• Coéquipiers protégés: -70% perte\n"
+            result_message += f"• Gagnants: -20% gain (victoire par dodge)\n\n"
+            result_message += f"↩️ *Réagissez avec ↩️ pour annuler ce match en cas de fraude*"
+            
+            # Envoyer dans le salon de résumés
+            # Note: Cette partie nécessiterait l'accès au guild via interaction
+            # Elle sera complétée lors de l'intégration finale
+            
+        except Exception as e:
+            print(f"Erreur dans send_match_summary_with_dodge: {e}")
         """Gère un vote de joueur"""
         try:
             # Vérifier que c'est un joueur du match
