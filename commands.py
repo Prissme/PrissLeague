@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Ultra Simplifié - COMMANDES
-Version avec attribution automatique du rôle ping
+Version avec attribution automatique du rôle ping + bouton annulation game
 """
 
 import discord
@@ -71,11 +71,11 @@ async def assign_ping_role_to_all_players(guild):
         return 0
 
 # ================================
-# CLASSES DE VOTE SIMPLIFIÉES
+# CLASSES DE VOTE AMÉLIORÉES
 # ================================
 
 class PlayerVoteView(discord.ui.View):
-    """Vue simplifiée pour le vote des joueurs avec auto-refresh"""
+    """Vue de vote des joueurs avec auto-refresh et vote d'annulation"""
     
     def __init__(self, team1_ids, team2_ids, lobby_id, room_code, guild):
         super().__init__(timeout=None)
@@ -86,7 +86,9 @@ class PlayerVoteView(discord.ui.View):
         self.guild = guild
         self.votes = {'team1': set(), 'team2': set()}
         self.dodge_reports = {}
+        self.cancel_votes = set()  # Nouveau : votes pour annuler
         self.match_validated = False
+        self.match_cancelled = False  # Nouveau : état d'annulation
         self.current_message = None
         self.refresh_task = None
         
@@ -97,9 +99,9 @@ class PlayerVoteView(discord.ui.View):
     async def _refresh_loop(self):
         """Boucle de refresh toutes les 15 minutes"""
         try:
-            while not self.match_validated:
+            while not self.match_validated and not self.match_cancelled:
                 await asyncio.sleep(900)  # 15 minutes
-                if not self.match_validated:
+                if not self.match_validated and not self.match_cancelled:
                     await self._refresh_message()
         except asyncio.CancelledError:
             pass
@@ -109,7 +111,7 @@ class PlayerVoteView(discord.ui.View):
     async def _refresh_message(self):
         """Refresh le message"""
         try:
-            if not self.current_message or self.match_validated:
+            if not self.current_message or self.match_validated or self.match_cancelled:
                 return
                 
             channel = self.guild.get_channel(RESULT_CHANNEL_ID)
@@ -121,6 +123,7 @@ class PlayerVoteView(discord.ui.View):
                                      self.lobby_id, self.room_code, self.guild)
             new_view.votes = self.votes.copy()
             new_view.dodge_reports = self.dodge_reports.copy()
+            new_view.cancel_votes = self.cancel_votes.copy()
             
             # Supprimer ancien message et créer le nouveau
             try:
@@ -154,6 +157,7 @@ class PlayerVoteView(discord.ui.View):
         # Statistiques de vote
         votes1 = len(self.votes['team1'])
         votes2 = len(self.votes['team2'])
+        cancel_count = len(self.cancel_votes)
         total_votes = votes1 + votes2
         
         message = f"🗳️ **VOTE DU RÉSULTAT** - Lobby #{self.lobby_id}\n"
@@ -172,6 +176,10 @@ class PlayerVoteView(discord.ui.View):
             for player_id, count in report_counts.items():
                 message += f"<@{player_id}>: {count} signalement(s)\n"
             message += "\n"
+        
+        # Votes d'annulation
+        if cancel_count > 0:
+            message += f"❌ **VOTES ANNULATION:** {cancel_count}/4\n\n"
         
         message += f"📊 Votes: {total_votes}/6 | Majorité: 4/6\n"
         message += "🔄 Auto-refresh: 15min"
@@ -200,8 +208,12 @@ class PlayerVoteView(discord.ui.View):
     async def report_dodge(self, interaction, button):
         await self.handle_dodge_report(interaction)
     
+    @discord.ui.button(label='❌ Annuler Game', style=discord.ButtonStyle.secondary)
+    async def cancel_game(self, interaction, button):
+        await self.handle_cancel_vote(interaction)
+    
     async def handle_vote(self, interaction, team):
-        """Gère un vote"""
+        """Gère un vote de résultat"""
         try:
             user_id = interaction.user.id
             all_players = set(self.team1_ids + self.team2_ids)
@@ -210,14 +222,17 @@ class PlayerVoteView(discord.ui.View):
                 await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent voter!", ephemeral=True)
                 return
                 
-            if self.match_validated:
-                await self.safe_respond(interaction, "❌ Match déjà validé!", ephemeral=True)
+            if self.match_validated or self.match_cancelled:
+                await self.safe_respond(interaction, "❌ Match déjà terminé!", ephemeral=True)
                 return
             
             # Retirer vote précédent et ajouter nouveau
             self.votes['team1'].discard(user_id)
             self.votes['team2'].discard(user_id)
             self.votes[team].add(user_id)
+            
+            # Retirer du vote d'annulation si présent
+            self.cancel_votes.discard(user_id)
             
             team_name = "Bleue 🔵" if team == 'team1' else "Rouge 🔴"
             await self.safe_respond(interaction, f"✅ Vote équipe {team_name} enregistré!", ephemeral=True)
@@ -243,33 +258,110 @@ class PlayerVoteView(discord.ui.View):
         except Exception as e:
             print(f"Erreur handle_vote: {e}")
     
-    async def handle_dodge_report(self, interaction):
-        """Gère signalement dodge simplifié"""
+    async def handle_cancel_vote(self, interaction):
+        """Gère un vote d'annulation de game"""
         try:
             user_id = interaction.user.id
             all_players = set(self.team1_ids + self.team2_ids)
             
-            if user_id not in all_players or self.match_validated:
-                await self.safe_respond(interaction, "❌ Action non autorisée", ephemeral=True)
+            if user_id not in all_players:
+                await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent voter!", ephemeral=True)
+                return
+                
+            if self.match_validated or self.match_cancelled:
+                await self.safe_respond(interaction, "❌ Match déjà terminé!", ephemeral=True)
                 return
             
-            # Menu simple avec tous les autres joueurs
+            # Toggle vote d'annulation
+            if user_id in self.cancel_votes:
+                self.cancel_votes.remove(user_id)
+                await self.safe_respond(interaction, "🔄 Vote d'annulation retiré", ephemeral=True)
+            else:
+                self.cancel_votes.add(user_id)
+                # Retirer des votes de résultat
+                self.votes['team1'].discard(user_id)
+                self.votes['team2'].discard(user_id)
+                await self.safe_respond(interaction, "❌ Vote d'annulation enregistré", ephemeral=True)
+            
+            # Vérifier si annulation validée (4 votes)
+            if len(self.cancel_votes) >= 4:
+                await self.cancel_match()
+            else:
+                await self._refresh_message()
+                
+        except Exception as e:
+            print(f"Erreur handle_cancel_vote: {e}")
+    
+    async def cancel_match(self):
+        """Annule le match"""
+        try:
+            self.match_cancelled = True
+            if self.refresh_task:
+                self.refresh_task.cancel()
+            
+            # Désactiver tous les boutons
+            for item in self.children:
+                item.disabled = True
+            
+            # Message d'annulation
+            cancel_msg = f"❌ **MATCH ANNULÉ** - Lobby #{self.lobby_id}\n"
+            cancel_msg += f"🗳️ Annulation votée par {len(self.cancel_votes)} joueurs\n"
+            cancel_msg += f"Code room: {self.room_code}"
+            
+            await self._update_message(cancel_msg)
+            
+            # Nettoyer le lobby de la base de données
+            from main import get_connection
+            conn = get_connection()
+            if conn:
+                try:
+                    with conn.cursor() as c:
+                        # Pas besoin de supprimer le lobby car il est déjà supprimé au lancement
+                        pass
+                finally:
+                    conn.close()
+            
+        except Exception as e:
+            print(f"Erreur cancel_match: {e}")
+    
+    async def handle_dodge_report(self, interaction):
+        """Gère signalement dodge avec menu simplifié"""
+        try:
+            user_id = interaction.user.id
+            all_players = set(self.team1_ids + self.team2_ids)
+            
+            if user_id not in all_players:
+                await self.safe_respond(interaction, "❌ Seuls les joueurs du match peuvent signaler!", ephemeral=True)
+                return
+                
+            if self.match_validated or self.match_cancelled:
+                await self.safe_respond(interaction, "❌ Match terminé!", ephemeral=True)
+                return
+            
+            # Créer menu avec tous les autres joueurs
             options = []
             for pid in all_players:
                 if pid != user_id:
+                    # Récupérer le nom du joueur
+                    member = self.guild.get_member(pid)
+                    display_name = member.display_name if member else f"Joueur {pid}"
                     options.append(discord.SelectOption(
-                        label=f"Joueur {pid}",
-                        value=str(pid)
+                        label=display_name,
+                        value=str(pid),
+                        description=f"ID: {pid}"
                     ))
             
             if options:
                 select = DodgeSelect(options, self, user_id)
                 view = discord.ui.View(timeout=300)
                 view.add_item(select)
-                await self.safe_respond(interaction, "Sélectionnez le joueur:", view=view, ephemeral=True)
+                await self.safe_respond(interaction, "🚨 Sélectionnez le joueur qui a dodge:", view=view, ephemeral=True)
+            else:
+                await self.safe_respond(interaction, "❌ Aucun autre joueur à signaler", ephemeral=True)
                 
         except Exception as e:
             print(f"Erreur handle_dodge_report: {e}")
+            await self.safe_respond(interaction, "❌ Erreur interne", ephemeral=True)
     
     async def process_dodge_report(self, reporter_id, reported_id):
         """Traite un signalement dodge"""
@@ -408,7 +500,18 @@ class PlayerVoteView(discord.ui.View):
         """Met à jour le message"""
         try:
             if self.current_message:
-                await self.current_message.edit(content=content, view=self if not self.match_validated else None)
+                # Désactiver tous les boutons si le match est terminé
+                disabled_view = None
+                if self.match_validated or self.match_cancelled:
+                    disabled_view = discord.ui.View()
+                    for item in self.children:
+                        item.disabled = True
+                        disabled_view.add_item(item)
+                
+                await self.current_message.edit(
+                    content=content, 
+                    view=disabled_view if disabled_view else self
+                )
         except Exception as e:
             print(f"Erreur _update_message: {e}")
     
@@ -466,10 +569,15 @@ class PlayerVoteView(discord.ui.View):
             print(f"Erreur send_match_summary: {e}")
 
 class DodgeSelect(discord.ui.Select):
-    """Menu de sélection pour dodge"""
+    """Menu de sélection pour dodge - version corrigée"""
     
     def __init__(self, options, vote_view, reporter_id):
-        super().__init__(placeholder="Choisir le joueur qui a dodge...", options=options)
+        super().__init__(
+            placeholder="Choisir le joueur qui a dodge...", 
+            options=options,
+            min_values=1,
+            max_values=1
+        )
         self.vote_view = vote_view
         self.reporter_id = reporter_id
     
@@ -477,12 +585,26 @@ class DodgeSelect(discord.ui.Select):
         try:
             reported_id = int(self.values[0])
             await self.vote_view.process_dodge_report(self.reporter_id, reported_id)
-            await self.vote_view.safe_respond(interaction, f"✅ Signalement enregistré", ephemeral=True)
+            
+            # Récupérer le nom du joueur signalé
+            reported_member = self.vote_view.guild.get_member(reported_id)
+            reported_name = reported_member.display_name if reported_member else f"Joueur {reported_id}"
+            
+            await self.vote_view.safe_respond(
+                interaction, 
+                f"✅ {reported_name} signalé pour dodge", 
+                ephemeral=True
+            )
         except Exception as e:
-            await self.vote_view.safe_respond(interaction, "❌ Erreur", ephemeral=True)
+            print(f"Erreur DodgeSelect callback: {e}")
+            await self.vote_view.safe_respond(
+                interaction, 
+                "❌ Erreur lors du signalement", 
+                ephemeral=True
+            )
 
 # ================================
-# COMMANDES SIMPLIFIÉES
+# COMMANDES SIMPLIFIÉES (inchangées)
 # ================================
 
 async def create_lobby_cmd(ctx, room_code: str = None):
@@ -1006,11 +1128,12 @@ async def setup_commands(bot):
             return
         await handle_match_cancel_reaction(payload)
     
-    print("✅ Commandes simplifiées chargées avec attribution automatique des rôles")
-    print("🎯 Attribution automatique du rôle ping à tous les joueurs")
-    print("🗳️ Système de vote avec auto-refresh activé")
-    print("🚨 Système anti-dodge activé")
-    print("↩️ Annulation par réaction activée")
+    print("✅ Commandes améliorées chargées avec:")
+    print("🎯 Attribution automatique du rôle ping")
+    print("🗳️ Système de vote avec auto-refresh")
+    print("🚨 Système anti-dodge CORRIGÉ")
+    print("❌ Bouton d'annulation de game (4 votes requis)")
+    print("↩️ Annulation par réaction")
     print(f"📺 Salon admin: {RESULT_CHANNEL_ID}")
     print(f"📋 Salon résumés: {MATCH_SUMMARY_CHANNEL_ID}")
-    print("🔧 Commande admin: !assignroles pour attribuer tous les rôles manuellement")
+    print("🔧 Commande admin: !assignroles")
