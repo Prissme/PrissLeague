@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Ultra Simplifié - FICHIER PRINCIPAL
-Configuration, base de données et lancement du bot avec système de vote des joueurs
+Configuration, base de données et lancement du bot avec système de vote des joueurs + BACKUP AUTOMATIQUE
 """
 
 import discord
@@ -12,8 +12,14 @@ from psycopg2.extras import RealDictCursor
 import os
 import logging
 import random
+import signal
+import sys
+import atexit
 from datetime import datetime, timedelta
 import json
+
+# Import du système de backup Python pur
+from backup import init_python_backup_system, get_backup_manager
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -59,6 +65,9 @@ intents.members = True  # Nécessaire pour get_member
 intents.reactions = True  # Nécessaire pour les réactions d'annulation
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
+# Gestionnaire de backup
+backup_manager = None
+
 # ================================
 # FONCTIONS UTILITAIRES
 # ================================
@@ -90,6 +99,31 @@ def calculate_dodge_penalty(dodge_count):
     else:
         # Pénalité progressive : 15, 20, 25, 30...
         return DODGE_PENALTY_BASE + ((dodge_count - 1) * DODGE_PENALTY_MULTIPLIER)
+
+# ================================
+# HANDLERS POUR ARRÊT PROPRE
+# ================================
+
+def signal_handler(sig, frame):
+    """Gestionnaire pour arrêt propre du bot"""
+    print(f"\n🛑 Signal {sig} reçu, arrêt en cours...")
+    cleanup_and_exit()
+
+def cleanup_and_exit():
+    """Nettoyage avant arrêt"""
+    global backup_manager
+    
+    if backup_manager:
+        print("💾 Backup final en cours...")
+        backup_manager.backup_on_shutdown()
+    
+    print("👋 Bot arrêté proprement")
+    sys.exit(0)
+
+# Enregistrer les handlers
+signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler)  # Kill
+atexit.register(cleanup_and_exit)  # Fallback
 
 # ================================
 # DATABASE POSTGRESQL
@@ -184,6 +218,10 @@ def init_db():
         logger.error(f"Erreur initialisation DB: {e}")
     finally:
         conn.close()
+
+# ================================
+# TOUTES LES AUTRES FONCTIONS DB (inchangées)
+# ================================
 
 def save_match_message_id(message_id):
     """Sauvegarde l'ID d'un message de match pour l'annulation par réaction"""
@@ -549,6 +587,10 @@ def undo_last_match():
     finally:
         conn.close()
 
+# ================================
+# FONCTIONS LOBBY (inchangées - trop longues à réécrire)
+# ================================
+
 def check_lobby_limits():
     """Vérifie les limites de création de lobby"""
     conn = get_connection()
@@ -763,11 +805,21 @@ def get_cooldown_info():
 @bot.event
 async def on_ready():
     """Quand le bot se connecte"""
+    global backup_manager
+    
     print(f'🤖 {bot.user} est connecté!')
     print(f'📊 Serveurs: {len(bot.guilds)}')
     
     # Initialiser la base de données
     init_db()
+    
+    # Initialiser le système de backup Python pur
+    backup_manager = init_python_backup_system(DATABASE_URL)
+    if backup_manager:
+        await backup_manager.start_auto_backup()
+        print("💾 Système backup Python activé (compatible Koyeb)")
+    else:
+        print("❌ Erreur initialisation backup")
     
     # Synchroniser les commandes slash
     try:
@@ -783,11 +835,11 @@ async def on_command_error(ctx, error):
         return  # Ignore les commandes inconnues
     
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ Permissions insuffisantes", suppress_embeds=True)
+        await ctx.send("❌ Permissions insuffisantes")
         return
     
     print(f'❌ Erreur commande: {error}')
-    await ctx.send("❌ Erreur interne du bot", suppress_embeds=True)
+    await ctx.send("❌ Erreur interne du bot")
 
 # ================================
 # LANCEMENT DU BOT
@@ -795,6 +847,8 @@ async def on_command_error(ctx, error):
 
 async def main():
     """Fonction principale pour lancer le bot"""
+    global backup_manager
+    
     if not TOKEN:
         print("❌ DISCORD_TOKEN manquant!")
         return
@@ -803,10 +857,133 @@ async def main():
         print("❌ DATABASE_URL manquant!")
         return
     
-    # Importer et configurer les commandes
+    # Importer et configurer les commandes avec backup
     try:
         from commands import setup_commands
         await setup_commands(bot)
+        
+        # Ajouter les commandes backup admin
+        @bot.command(name='backup')
+        async def _backup(ctx):
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ Admin uniquement")
+                return
+            
+            if not backup_manager:
+                await ctx.send("❌ Système backup non initialisé")
+                return
+            
+            await ctx.send("💾 Backup en cours...")
+            success = backup_manager.create_backup("manual")
+            
+            if success:
+                await ctx.send("✅ Backup créé avec succès!")
+            else:
+                await ctx.send("❌ Erreur lors du backup")
+        
+        @bot.command(name='listbackups')
+        async def _listbackups(ctx):
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ Admin uniquement")
+                return
+                
+            if not backup_manager:
+                await ctx.send("❌ Système backup non initialisé")
+                return
+            
+            backups = backup_manager.list_backups()
+            
+            if not backups:
+                await ctx.send("📁 Aucun backup trouvé")
+                return
+            
+            message = f"📁 **LISTE DES BACKUPS** ({len(backups)} fichiers)\n\n"
+            
+            for i, backup in enumerate(backups[:10], 1):  # Limiter à 10 pour Discord
+                date_str = backup['date'].strftime('%d/%m/%Y %H:%M')
+                size_str = f"{backup['size_kb']:.1f} KB"
+                message += f"{i}. {backup['filename']}\n"
+                message += f"   📅 {date_str} | 💾 {size_str}\n\n"
+            
+            if len(backups) > 10:
+                message += f"... et {len(backups) - 10} autres fichiers"
+            
+            await ctx.send(message)
+        
+        @bot.command(name='restore')
+        async def _restore(ctx, filename: str = None):
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ Admin uniquement")
+                return
+                
+            if not backup_manager:
+                await ctx.send("❌ Système backup non initialisé")
+                return
+            
+            if not filename:
+                await ctx.send("❌ Usage: !restore <nom_fichier.json.gz>\nUtilisez !listbackups pour voir les fichiers disponibles")
+                return
+            
+            # Confirmation de sécurité
+            await ctx.send(f"⚠️ **ATTENTION DANGER** ⚠️\n"
+                          f"Vous allez ÉCRASER TOUTES les données actuelles!\n"
+                          f"Fichier: {filename}\n\n"
+                          f"Tapez `CONFIRMER RESTORE` pour continuer ou ignorez ce message pour annuler.")
+            
+            def check(m):
+                return m.author == ctx.author and m.content == "CONFIRMER RESTORE"
+            
+            try:
+                await bot.wait_for('message', check=check, timeout=30.0)
+                
+                await ctx.send("🔄 Restoration en cours... (peut prendre quelques secondes)")
+                success = backup_manager.restore_from_backup(filename)
+                
+                if success:
+                    await ctx.send("✅ Restoration terminée avec succès!\n⚠️ Redémarrez le bot pour éviter les problèmes")
+                else:
+                    await ctx.send("❌ Erreur lors de la restoration")
+                    
+            except asyncio.TimeoutError:
+                await ctx.send("⏰ Restoration annulée (timeout)")
+        
+        @bot.command(name='backupinfo')
+        async def _backupinfo(ctx):
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ Admin uniquement")
+                return
+                
+            if not backup_manager:
+                await ctx.send("❌ Système backup non initialisé")
+                return
+            
+            backups = backup_manager.list_backups()
+            
+            message = f"💾 **SYSTÈME BACKUP**\n\n"
+            message += f"🛠️ Type: Python pur (compatible Koyeb)\n"
+            message += f"📁 Dossier: /tmp/backups\n"
+            message += f"🕕 Fréquence: 6 heures\n"
+            message += f"📊 Fichiers: {len(backups)}/{backup_manager.max_backups}\n"
+            
+            if backups:
+                total_size = sum(b['size_kb'] for b in backups)
+                message += f"💽 Taille totale: {total_size:.1f} KB\n"
+                
+                latest = backups[0]
+                message += f"\n**Dernier backup:**\n"
+                message += f"📄 {latest['filename']}\n"
+                message += f"📅 {latest['date'].strftime('%d/%m/%Y %H:%M:%S')}\n"
+                message += f"📏 {latest['size_kb']:.1f} KB"
+            else:
+                message += "\n❌ Aucun backup trouvé"
+            
+            message += f"\n\n**Commandes:**\n"
+            message += f"• `!backup` - Créer un backup\n"
+            message += f"• `!listbackups` - Lister les backups\n"
+            message += f"• `!restore <fichier>` - Restaurer (DANGER)"
+            
+            await ctx.send(message)
+        
     except ImportError as e:
         print(f"❌ Erreur import commands.py: {e}")
         return
@@ -816,6 +993,11 @@ async def main():
         await bot.start(TOKEN)
     except Exception as e:
         print(f"❌ Erreur lancement bot: {e}")
+    finally:
+        # Arrêt propre du système de backup
+        if backup_manager:
+            await backup_manager.stop_auto_backup()
+            print("💾 Système backup arrêté")
 
 if __name__ == '__main__':
     import asyncio
