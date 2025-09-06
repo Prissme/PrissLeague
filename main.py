@@ -897,17 +897,23 @@ async def main():
                 await ctx.send("📁 Aucun backup trouvé")
                 return
             
-            message = f"📁 **LISTE DES BACKUPS** ({len(backups)} fichiers)\n\n"
+            message = f"📁 **BACKUPS SUPABASE COMPLETS** ({len(backups)} fichiers)\n\n"
             
-            for i, backup in enumerate(backups[:10], 1):  # Limiter à 10 pour Discord
-                date_str = backup['date'].strftime('%d/%m/%Y %H:%M')
-                size_str = f"{backup['size_kb']:.1f} KB"
-                message += f"{i}. {backup['filename']}\n"
-                message += f"   📅 {date_str} | 💾 {size_str}\n\n"
+            for i, backup in enumerate(backups[:8], 1):  # Limiter à 8 pour Discord
+                date_str = backup['date'].strftime('%d/%m %H:%M')
+                size_str = f"{backup['size_kb']:.1f}KB"
+                tables = backup['tables_count']
+                records = backup['total_records']
+                reason = backup['reason']
+                
+                message += f"**{i}.** `{backup['filename']}`\n"
+                message += f"📅 {date_str} | 💾 {size_str} | 📊 {tables} tables ({records} records)\n"
+                message += f"🔖 Raison: {reason}\n\n"
             
-            if len(backups) > 10:
-                message += f"... et {len(backups) - 10} autres fichiers"
+            if len(backups) > 8:
+                message += f"... et {len(backups) - 8} autres fichiers\n\n"
             
+            message += "💡 **Usage:** `!restore nom_fichier.json.gz`"
             await ctx.send(message)
         
         @bot.command(name='restore')
@@ -947,8 +953,48 @@ async def main():
             except asyncio.TimeoutError:
                 await ctx.send("⏰ Restoration annulée (timeout)")
         
-        @bot.command(name='backupinfo')
-        async def _backupinfo(ctx):
+        @bot.command(name='downloadbackup')
+        async def _downloadbackup(ctx, filename: str = None):
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("❌ Admin uniquement")
+                return
+                
+            if not backup_manager:
+                await ctx.send("❌ Système backup non initialisé")
+                return
+            
+            if not filename:
+                # Télécharger le dernier backup
+                backups = backup_manager.list_backups()
+                if not backups:
+                    await ctx.send("❌ Aucun backup disponible")
+                    return
+                filename = backups[0]['filename']
+            
+            try:
+                filepath = os.path.join('/tmp/backups', filename)
+                
+                if not os.path.exists(filepath):
+                    await ctx.send(f"❌ Fichier {filename} introuvable")
+                    return
+                
+                # Vérifier la taille (limite Discord 25MB)
+                file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                
+                if file_size_mb > 25:
+                    await ctx.send(f"❌ Fichier trop volumineux ({file_size_mb:.1f}MB > 25MB limite Discord)")
+                    return
+                
+                # Envoyer le fichier
+                await ctx.send(f"📤 Téléchargement: {filename} ({file_size_mb:.2f}MB)")
+                
+                with open(filepath, 'rb') as f:
+                    await ctx.send(file=discord.File(f, filename))
+                
+                await ctx.send("✅ Backup téléchargé!")
+                
+            except Exception as e:
+                await ctx.send(f"❌ Erreur téléchargement: {e}")
             if not ctx.author.guild_permissions.administrator:
                 await ctx.send("❌ Admin uniquement")
                 return
