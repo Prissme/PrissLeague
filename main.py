@@ -3,6 +3,7 @@
 """
 Bot ELO Ultra Simplifié - FICHIER PRINCIPAL
 Configuration, base de données et lancement du bot avec système de vote des joueurs + BACKUP AUTOMATIQUE
+Version corrigée avec gestion d'erreurs sécurisée
 """
 
 import discord
@@ -15,6 +16,7 @@ import random
 import signal
 import sys
 import atexit
+import asyncio
 from datetime import datetime, timedelta
 import json
 
@@ -220,7 +222,7 @@ def init_db():
         conn.close()
 
 # ================================
-# TOUTES LES AUTRES FONCTIONS DB (inchangées)
+# FONCTIONS DATABASE
 # ================================
 
 def save_match_message_id(message_id):
@@ -588,7 +590,7 @@ def undo_last_match():
         conn.close()
 
 # ================================
-# FONCTIONS LOBBY (inchangées - trop longues à réécrire)
+# FONCTIONS LOBBY
 # ================================
 
 def check_lobby_limits():
@@ -799,7 +801,7 @@ def get_cooldown_info():
         conn.close()
 
 # ================================
-# BOT EVENTS
+# BOT EVENTS - VERSION SÉCURISÉE
 # ================================
 
 @bot.event
@@ -830,16 +832,48 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx, error):
-    """Gestion globale des erreurs"""
-    if isinstance(error, commands.CommandNotFound):
-        return  # Ignore les commandes inconnues
+    """Gestion globale des erreurs - Version sécurisée"""
     
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ Permissions insuffisantes")
+    # Ignorer les commandes inconnues silencieusement
+    if isinstance(error, commands.CommandNotFound):
         return
     
-    print(f'❌ Erreur commande: {error}')
-    await ctx.send("❌ Erreur interne du bot")
+    # Logger l'erreur dans la console pour debug
+    error_msg = f"[ERROR] {ctx.author} dans #{ctx.channel}: {type(error).__name__}: {error}"
+    print(error_msg)
+    logger.error(error_msg)
+    
+    # Déterminer le message d'erreur approprié
+    user_message = None
+    
+    if isinstance(error, commands.MissingPermissions):
+        user_message = "❌ Permissions insuffisantes"
+    elif isinstance(error, commands.MissingRequiredArgument):
+        user_message = f"❌ Argument manquant: {error.param.name}"
+    elif isinstance(error, commands.BadArgument):
+        user_message = "❌ Arguments invalides"
+    elif isinstance(error, commands.CommandOnCooldown):
+        user_message = f"⏰ Cooldown: {error.retry_after:.1f}s"
+    elif isinstance(error, discord.Forbidden):
+        # Ne pas essayer d'envoyer un message si on n'a pas les permissions
+        print(f"[PERMISSION] Bot n'a pas les droits dans #{ctx.channel}")
+        return
+    elif isinstance(error, discord.HTTPException):
+        print(f"[HTTP_ERROR] Erreur Discord API: {error}")
+        user_message = "❌ Erreur réseau Discord"
+    else:
+        user_message = "❌ Erreur interne"
+    
+    # Essayer d'envoyer le message d'erreur de manière sécurisée
+    if user_message:
+        try:
+            await ctx.send(user_message)
+        except discord.Forbidden:
+            print(f"[PERMISSION] Impossible d'envoyer message d'erreur dans #{ctx.channel}")
+        except discord.HTTPException as e:
+            print(f"[HTTP_ERROR] Erreur envoi message: {e}")
+        except Exception as e:
+            print(f"[UNKNOWN_ERROR] Erreur inattendue envoi message: {e}")
 
 # ================================
 # LANCEMENT DU BOT
@@ -873,13 +907,20 @@ async def main():
                 await ctx.send("❌ Système backup non initialisé")
                 return
             
-            await ctx.send("💾 Backup en cours...")
-            success = backup_manager.create_backup("manual")
-            
-            if success:
-                await ctx.send("✅ Backup créé avec succès!")
-            else:
-                await ctx.send("❌ Erreur lors du backup")
+            try:
+                await ctx.send("💾 Backup en cours...")
+                success = backup_manager.create_backup("manual")
+                
+                if success:
+                    await ctx.send("✅ Backup créé avec succès!")
+                else:
+                    await ctx.send("❌ Erreur lors du backup")
+            except Exception as e:
+                print(f"Erreur commande backup: {e}")
+                try:
+                    await ctx.send("❌ Erreur interne")
+                except:
+                    pass
         
         @bot.command(name='listbackups')
         async def _listbackups(ctx):
@@ -891,30 +932,34 @@ async def main():
                 await ctx.send("❌ Système backup non initialisé")
                 return
             
-            backups = backup_manager.list_backups()
-            
-            if not backups:
-                await ctx.send("📁 Aucun backup trouvé")
-                return
-            
-            message = f"📁 **BACKUPS SUPABASE COMPLETS** ({len(backups)} fichiers)\n\n"
-            
-            for i, backup in enumerate(backups[:8], 1):  # Limiter à 8 pour Discord
-                date_str = backup['date'].strftime('%d/%m %H:%M')
-                size_str = f"{backup['size_kb']:.1f}KB"
-                tables = backup['tables_count']
-                records = backup['total_records']
-                reason = backup['reason']
+            try:
+                backups = backup_manager.list_backups()
                 
-                message += f"**{i}.** `{backup['filename']}`\n"
-                message += f"📅 {date_str} | 💾 {size_str} | 📊 {tables} tables ({records} records)\n"
-                message += f"🔖 Raison: {reason}\n\n"
-            
-            if len(backups) > 8:
-                message += f"... et {len(backups) - 8} autres fichiers\n\n"
-            
-            message += "💡 **Usage:** `!restore nom_fichier.json.gz`"
-            await ctx.send(message)
+                if not backups:
+                    await ctx.send("📁 Aucun backup trouvé")
+                    return
+                
+                message = f"📁 **BACKUPS SUPABASE** ({len(backups)} fichiers)\n\n"
+                
+                for i, backup in enumerate(backups[:8], 1):  # Limiter à 8 pour Discord
+                    date_str = backup['date'].strftime('%d/%m %H:%M')
+                    size_str = f"{backup['size_kb']:.1f}KB"
+                    
+                    message += f"**{i}.** `{backup['filename']}`\n"
+                    message += f"📅 {date_str} | 💾 {size_str}\n\n"
+                
+                if len(backups) > 8:
+                    message += f"... et {len(backups) - 8} autres fichiers\n\n"
+                
+                message += "💡 **Usage:** `!restore nom_fichier.json.gz`"
+                await ctx.send(message)
+                
+            except Exception as e:
+                print(f"Erreur listbackups: {e}")
+                try:
+                    await ctx.send("❌ Erreur lors de la liste")
+                except:
+                    pass
         
         @bot.command(name='restore')
         async def _restore(ctx, filename: str = None):
@@ -930,28 +975,36 @@ async def main():
                 await ctx.send("❌ Usage: !restore <nom_fichier.json.gz>\nUtilisez !listbackups pour voir les fichiers disponibles")
                 return
             
-            # Confirmation de sécurité
-            await ctx.send(f"⚠️ **ATTENTION DANGER** ⚠️\n"
-                          f"Vous allez ÉCRASER TOUTES les données actuelles!\n"
-                          f"Fichier: {filename}\n\n"
-                          f"Tapez `CONFIRMER RESTORE` pour continuer ou ignorez ce message pour annuler.")
-            
-            def check(m):
-                return m.author == ctx.author and m.content == "CONFIRMER RESTORE"
-            
             try:
-                await bot.wait_for('message', check=check, timeout=30.0)
+                # Confirmation de sécurité
+                await ctx.send(f"⚠️ **ATTENTION DANGER** ⚠️\n"
+                              f"Vous allez ÉCRASER TOUTES les données actuelles!\n"
+                              f"Fichier: {filename}\n\n"
+                              f"Tapez `CONFIRMER RESTORE` pour continuer ou ignorez ce message pour annuler.")
                 
-                await ctx.send("🔄 Restoration en cours... (peut prendre quelques secondes)")
-                success = backup_manager.restore_from_backup(filename)
+                def check(m):
+                    return m.author == ctx.author and m.content == "CONFIRMER RESTORE"
                 
-                if success:
-                    await ctx.send("✅ Restoration terminée avec succès!\n⚠️ Redémarrez le bot pour éviter les problèmes")
-                else:
-                    await ctx.send("❌ Erreur lors de la restoration")
+                try:
+                    await bot.wait_for('message', check=check, timeout=30.0)
                     
-            except asyncio.TimeoutError:
-                await ctx.send("⏰ Restoration annulée (timeout)")
+                    await ctx.send("🔄 Restoration en cours... (peut prendre quelques secondes)")
+                    success = backup_manager.restore_from_backup(filename)
+                    
+                    if success:
+                        await ctx.send("✅ Restoration terminée avec succès!\n⚠️ Redémarrez le bot pour éviter les problèmes")
+                    else:
+                        await ctx.send("❌ Erreur lors de la restoration")
+                        
+                except asyncio.TimeoutError:
+                    await ctx.send("⏰ Restoration annulée (timeout)")
+                    
+            except Exception as e:
+                print(f"Erreur restore: {e}")
+                try:
+                    await ctx.send("❌ Erreur interne")
+                except:
+                    pass
         
         @bot.command(name='downloadbackup')
         async def _downloadbackup(ctx, filename: str = None):
@@ -965,11 +1018,16 @@ async def main():
             
             if not filename:
                 # Télécharger le dernier backup
-                backups = backup_manager.list_backups()
-                if not backups:
-                    await ctx.send("❌ Aucun backup disponible")
+                try:
+                    backups = backup_manager.list_backups()
+                    if not backups:
+                        await ctx.send("❌ Aucun backup disponible")
+                        return
+                    filename = backups[0]['filename']
+                except Exception as e:
+                    print(f"Erreur récupération backups: {e}")
+                    await ctx.send("❌ Erreur lors de la récupération des backups")
                     return
-                filename = backups[0]['filename']
             
             try:
                 filepath = os.path.join('/tmp/backups', filename)
@@ -994,7 +1052,14 @@ async def main():
                 await ctx.send("✅ Backup téléchargé!")
                 
             except Exception as e:
-                await ctx.send(f"❌ Erreur téléchargement: {e}")
+                print(f"Erreur téléchargement: {e}")
+                try:
+                    await ctx.send(f"❌ Erreur téléchargement")
+                except:
+                    pass
+        
+        @bot.command(name='backupstatus')
+        async def _backupstatus(ctx):
             if not ctx.author.guild_permissions.administrator:
                 await ctx.send("❌ Admin uniquement")
                 return
@@ -1003,40 +1068,54 @@ async def main():
                 await ctx.send("❌ Système backup non initialisé")
                 return
             
-            backups = backup_manager.list_backups()
-            
-            message = f"💾 **SYSTÈME BACKUP**\n\n"
-            message += f"🛠️ Type: Python pur (compatible Koyeb)\n"
-            message += f"📁 Dossier: /tmp/backups\n"
-            message += f"🕕 Fréquence: 6 heures\n"
-            message += f"📊 Fichiers: {len(backups)}/{backup_manager.max_backups}\n"
-            
-            if backups:
-                total_size = sum(b['size_kb'] for b in backups)
-                message += f"💽 Taille totale: {total_size:.1f} KB\n"
+            try:
+                backups = backup_manager.list_backups()
                 
-                latest = backups[0]
-                message += f"\n**Dernier backup:**\n"
-                message += f"📄 {latest['filename']}\n"
-                message += f"📅 {latest['date'].strftime('%d/%m/%Y %H:%M:%S')}\n"
-                message += f"📏 {latest['size_kb']:.1f} KB"
-            else:
-                message += "\n❌ Aucun backup trouvé"
-            
-            message += f"\n\n**Commandes:**\n"
-            message += f"• `!backup` - Créer un backup\n"
-            message += f"• `!listbackups` - Lister les backups\n"
-            message += f"• `!restore <fichier>` - Restaurer (DANGER)"
-            
-            await ctx.send(message)
+                message = f"💾 **SYSTÈME BACKUP**\n\n"
+                message += f"🛠️ Type: Python pur (compatible Koyeb)\n"
+                message += f"📁 Dossier: /tmp/backups\n"
+                message += f"🕕 Fréquence: 6 heures\n"
+                message += f"📊 Fichiers: {len(backups)}/{backup_manager.max_backups}\n"
+                
+                if backups:
+                    total_size = sum(b['size_kb'] for b in backups)
+                    message += f"💽 Taille totale: {total_size:.1f} KB\n"
+                    
+                    latest = backups[0]
+                    message += f"\n**Dernier backup:**\n"
+                    message += f"📄 {latest['filename']}\n"
+                    message += f"📅 {latest['date'].strftime('%d/%m/%Y %H:%M:%S')}\n"
+                    message += f"📏 {latest['size_kb']:.1f} KB"
+                else:
+                    message += "\n❌ Aucun backup trouvé"
+                
+                message += f"\n\n**Commandes:**\n"
+                message += f"• `!backup` - Créer un backup\n"
+                message += f"• `!listbackups` - Lister les backups\n"
+                message += f"• `!restore <fichier>` - Restaurer (DANGER)\n"
+                message += f"• `!downloadbackup [fichier]` - Télécharger backup"
+                
+                await ctx.send(message)
+                
+            except Exception as e:
+                print(f"Erreur backupstatus: {e}")
+                try:
+                    await ctx.send("❌ Erreur lors du statut")
+                except:
+                    pass
         
     except ImportError as e:
         print(f"❌ Erreur import commands.py: {e}")
         return
     
-    # Lancer le bot
+    # Lancer le bot avec gestion d'erreurs
     try:
+        print("🚀 Démarrage du bot Discord...")
         await bot.start(TOKEN)
+    except discord.LoginFailure:
+        print("❌ Token Discord invalide!")
+    except discord.HTTPException as e:
+        print(f"❌ Erreur HTTP Discord: {e}")
     except Exception as e:
         print(f"❌ Erreur lancement bot: {e}")
     finally:
@@ -1044,7 +1123,15 @@ async def main():
         if backup_manager:
             await backup_manager.stop_auto_backup()
             print("💾 Système backup arrêté")
+        print("👋 Bot arrêté")
 
 if __name__ == '__main__':
     import asyncio
-    asyncio.run(main())
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Arrêt demandé par l'utilisateur")
+    except Exception as e:
+        print(f"❌ Erreur fatale: {e}")
+        sys.exit(1)
