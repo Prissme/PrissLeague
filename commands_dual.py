@@ -1,153 +1,5 @@
 await ctx.send(message)
     
-    # Commandes lobbies séparées
-    @bot.command(name='soloqueue')
-    async def _list_solo_lobbies(ctx):
-        from main import MAX_CONCURRENT_LOBBIES_SOLO, LOBBY_COOLDOWN_MINUTES_SOLO
-        
-        conn = get_connection()
-        if not conn:
-            await ctx.send("❌ Erreur de connexion")
-            return
-        
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'solo' ORDER BY created_at DESC")
-                lobbies = c.fetchall()
-                
-                # Cooldown
-                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 1")
-                result = c.fetchone()
-                
-                cooldown_active = False
-                if result:
-                    last_creation = result['last_creation']
-                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_SOLO)
-                    now = datetime.now()
-                    cooldown_active = now < cooldown_end
-        finally:
-            conn.close()
-        
-        message = f"🥇 **LOBBIES SOLO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_SOLO})\n\n"
-        
-        if not lobbies:
-            message += "Aucun lobby solo actif\n"
-        else:
-            for lobby in lobbies:
-                players_count = len(lobby['players'].split(',')) if lobby['players'] else 0
-                status = "🟢" if players_count < 6 else "🔴"
-                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({players_count}/6)\n"
-        
-        if cooldown_active:
-            remaining = cooldown_end - datetime.now()
-            minutes = int(remaining.total_seconds() // 60)
-            seconds = int(remaining.total_seconds() % 60)
-            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
-        else:
-            message += "\n✅ Création possible"
-        
-        await ctx.send(message)
-    
-    @bot.command(name='trioqueue')
-    async def _list_trio_lobbies(ctx):
-        from main import MAX_CONCURRENT_LOBBIES_TRIO, LOBBY_COOLDOWN_MINUTES_TRIO
-        
-        conn = get_connection()
-        if not conn:
-            await ctx.send("❌ Erreur de connexion")
-            return
-        
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'trio' ORDER BY created_at DESC")
-                lobbies = c.fetchall()
-                
-                # Cooldown
-                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 2")
-                result = c.fetchone()
-                
-                cooldown_active = False
-                if result:
-                    last_creation = result['last_creation']
-                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_TRIO)
-                    now = datetime.now()
-                    cooldown_active = now < cooldown_end
-        finally:
-            conn.close()
-        
-        message = f"👥 **LOBBIES TRIO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_TRIO})\n\n"
-        
-        if not lobbies:
-            message += "Aucun lobby trio actif\n"
-        else:
-            for lobby in lobbies:
-                teams_count = len(lobby['teams'].split(',')) if lobby['teams'] else 0
-                status = "🟢" if teams_count < 2 else "🔴"
-                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({teams_count}/2 équipes)\n"
-        
-        if cooldown_active:
-            remaining = cooldown_end - datetime.now()
-            minutes = int(remaining.total_seconds() // 60)
-            seconds = int(remaining.total_seconds() % 60)
-            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
-        else:
-            message += "\n✅ Création possible"
-        
-        await ctx.send(message)
-    
-    # Commandes équipe
-    @bot.command(name='createteam')
-    async def _create_team(ctx, teammate1: discord.Member, teammate2: discord.Member, *, team_name: str):
-        from main import get_player, create_player, create_trio_team
-        
-        if len(team_name) > 30:
-            await ctx.send("❌ Nom d'équipe trop long (30 caractères max)")
-            return
-        
-        # Vérifier que tous les joueurs existent
-        for member in [ctx.author, teammate1, teammate2]:
-            player = get_player(member.id)
-            if not player:
-                create_player(member.id, member.display_name)
-            await ensure_player_has_ping_role(ctx.guild, member.id)
-        
-        # Créer l'équipe
-        success, msg = create_trio_team(ctx.author.id, teammate1.id, teammate2.id, team_name)
-        if success:
-            await ctx.send(f"✅ **Équipe Trio créée!**\n"
-                          f"📝 Nom: {team_name}\n"
-                          f"👑 Capitaine: {ctx.author.display_name}\n"
-                          f"👥 Équipiers: {teammate1.display_name}, {teammate2.display_name}\n\n"
-                          f"Vous pouvez maintenant rejoindre des lobbies trio avec `!trio <code>`")
-        else:
-            await ctx.send(f"❌ {msg}")
-    
-    @bot.command(name='myteam')
-    async def _my_team(ctx):
-        from main import get_player_trio_team
-        
-        team = get_player_trio_team(ctx.author.id)
-        if not team:
-            await ctx.send("❌ Vous n'avez pas d'équipe trio. Utilisez `!createteam @joueur1 @joueur2 Nom`")
-            return
-        
-        # Récupérer les noms des joueurs
-        captain = ctx.guild.get_member(int(team['captain_id']))
-        player2 = ctx.guild.get_member(int(team['player2_id']))
-        player3 = ctx.guild.get_member(int(team['player3_id']))
-        
-        captain_name = captain.display_name if captain else f"ID:{team['captain_id']}"
-        player2_name = player2.display_name if player2 else f"ID:{team['player2_id']}"
-        player3_name = player3.display_name if player3 else f"ID:{team['player3_id']}"
-        
-        message = f"👥 **Équipe: {team['name']}**\n"
-        message += f"👑 Capitaine: {captain_name}\n"
-        message += f"👤 Équipiers: {player2_name}, {player3_name}\n"
-        message += f"📅 Créée: {team['created_at'].strftime('%d/%m/%Y')}\n\n"
-        message += f"💡 Rejoignez des lobbies trio avec `!trio <code>`"
-        
-        await ctx.send(message)
-    
     @bot.command(name='dissolveteam')
     async def _dissolve_team(ctx):
         from main import get_player_trio_team, delete_trio_team
@@ -621,7 +473,221 @@ async def record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
         await summary_msg.add_reaction("↩️")
         save_match_message_id(summary_msg.id, match_type)
     
-    await interaction.edit_original_response(content="✅ Match enregistré!")#!/usr/bin/env python3
+    await interaction.edit_original_response(content="✅ Match enregistré!")
+    
+    # Classements séparés
+    @bot.command(name='topsolo')
+    async def _leaderboard_solo(ctx):
+        from main import get_leaderboard, get_player
+        
+        players = get_leaderboard('solo')[:10]
+        if not players:
+            await ctx.send("📊 Classement solo vide")
+            return
+        
+        message = "🥇 **CLASSEMENT SOLO**\n\n"
+        
+        for i, player in enumerate(players, 1):
+            try:
+                member = ctx.guild.get_member(int(player['discord_id']))
+                name = member.display_name if member else player['name']
+            except:
+                name = player['name']
+            
+            winrate = round(player['solo_wins'] / max(1, player['solo_wins'] + player['solo_losses']) * 100, 1)
+            emoji = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
+            message += f"{emoji} {name} - {player['solo_elo']} ELO ({winrate}%)\n"
+        
+        # Position joueur actuel
+        current_player = get_player(ctx.author.id)
+        if current_player:
+            all_players = get_leaderboard('solo')
+            pos = next((i for i, p in enumerate(all_players, 1) if p['discord_id'] == str(ctx.author.id)), None)
+            if pos:
+                message += f"\n**Votre position:** #{pos} - {current_player['solo_elo']} ELO"
+        
+        await ctx.send(message)
+    
+    @bot.command(name='toptrio')
+    async def _leaderboard_trio(ctx):
+        from main import get_leaderboard, get_player
+        
+        players = get_leaderboard('trio')[:10]
+        if not players:
+            await ctx.send("📊 Classement trio vide")
+            return
+        
+        message = "👥 **CLASSEMENT TRIO**\n\n"
+        
+        for i, player in enumerate(players, 1):
+            try:
+                member = ctx.guild.get_member(int(player['discord_id']))
+                name = member.display_name if member else player['name']
+            except:
+                name = player['name']
+            
+            winrate = round(player['trio_wins'] / max(1, player['trio_wins'] + player['trio_losses']) * 100, 1)
+            emoji = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
+            message += f"{emoji} {name} - {player['trio_elo']} ELO ({winrate}%)\n"
+        
+        # Position joueur actuel
+        current_player = get_player(ctx.author.id)
+        if current_player:
+            all_players = get_leaderboard('trio')
+            pos = next((i for i, p in enumerate(all_players, 1) if p['discord_id'] == str(ctx.author.id)), None)
+            if pos:
+                message += f"\n**Votre position:** #{pos} - {current_player['trio_elo']} ELO"
+        
+        await ctx.send(message)
+    
+    # Commandes lobbies séparées
+    @bot.command(name='soloqueue')
+    async def _list_solo_lobbies(ctx):
+        from main import MAX_CONCURRENT_LOBBIES_SOLO, LOBBY_COOLDOWN_MINUTES_SOLO
+        
+        conn = get_connection()
+        if not conn:
+            await ctx.send("❌ Erreur de connexion")
+            return
+        
+        try:
+            with conn.cursor() as c:
+                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'solo' ORDER BY created_at DESC")
+                lobbies = c.fetchall()
+                
+                # Cooldown
+                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 1")
+                result = c.fetchone()
+                
+                cooldown_active = False
+                if result:
+                    last_creation = result['last_creation']
+                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_SOLO)
+                    now = datetime.now()
+                    cooldown_active = now < cooldown_end
+        finally:
+            conn.close()
+        
+        message = f"🥇 **LOBBIES SOLO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_SOLO})\n\n"
+        
+        if not lobbies:
+            message += "Aucun lobby solo actif\n"
+        else:
+            for lobby in lobbies:
+                players_count = len(lobby['players'].split(',')) if lobby['players'] else 0
+                status = "🟢" if players_count < 6 else "🔴"
+                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({players_count}/6)\n"
+        
+        if cooldown_active:
+            remaining = cooldown_end - datetime.now()
+            minutes = int(remaining.total_seconds() // 60)
+            seconds = int(remaining.total_seconds() % 60)
+            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
+        else:
+            message += "\n✅ Création possible"
+        
+        await ctx.send(message)
+    
+    @bot.command(name='trioqueue')
+    async def _list_trio_lobbies(ctx):
+        from main import MAX_CONCURRENT_LOBBIES_TRIO, LOBBY_COOLDOWN_MINUTES_TRIO
+        
+        conn = get_connection()
+        if not conn:
+            await ctx.send("❌ Erreur de connexion")
+            return
+        
+        try:
+            with conn.cursor() as c:
+                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'trio' ORDER BY created_at DESC")
+                lobbies = c.fetchall()
+                
+                # Cooldown
+                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 2")
+                result = c.fetchone()
+                
+                cooldown_active = False
+                if result:
+                    last_creation = result['last_creation']
+                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_TRIO)
+                    now = datetime.now()
+                    cooldown_active = now < cooldown_end
+        finally:
+            conn.close()
+        
+        message = f"👥 **LOBBIES TRIO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_TRIO})\n\n"
+        
+        if not lobbies:
+            message += "Aucun lobby trio actif\n"
+        else:
+            for lobby in lobbies:
+                teams_count = len(lobby['teams'].split(',')) if lobby['teams'] else 0
+                status = "🟢" if teams_count < 2 else "🔴"
+                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({teams_count}/2 équipes)\n"
+        
+        if cooldown_active:
+            remaining = cooldown_end - datetime.now()
+            minutes = int(remaining.total_seconds() // 60)
+            seconds = int(remaining.total_seconds() % 60)
+            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
+        else:
+            message += "\n✅ Création possible"
+        
+        await ctx.send(message)
+    
+    # Commandes équipe
+    @bot.command(name='createteam')
+    async def _create_team(ctx, teammate1: discord.Member, teammate2: discord.Member, *, team_name: str):
+        from main import get_player, create_player, create_trio_team
+        
+        if len(team_name) > 30:
+            await ctx.send("❌ Nom d'équipe trop long (30 caractères max)")
+            return
+        
+        # Vérifier que tous les joueurs existent
+        for member in [ctx.author, teammate1, teammate2]:
+            player = get_player(member.id)
+            if not player:
+                create_player(member.id, member.display_name)
+            await ensure_player_has_ping_role(ctx.guild, member.id)
+        
+        # Créer l'équipe
+        success, msg = create_trio_team(ctx.author.id, teammate1.id, teammate2.id, team_name)
+        if success:
+            await ctx.send(f"✅ **Équipe Trio créée!**\n"
+                          f"📝 Nom: {team_name}\n"
+                          f"👑 Capitaine: {ctx.author.display_name}\n"
+                          f"👥 Équipiers: {teammate1.display_name}, {teammate2.display_name}\n\n"
+                          f"Vous pouvez maintenant rejoindre des lobbies trio avec `!trio <code>`")
+        else:
+            await ctx.send(f"❌ {msg}")
+    
+    @bot.command(name='myteam')
+    async def _my_team(ctx):
+        from main import get_player_trio_team
+        
+        team = get_player_trio_team(ctx.author.id)
+        if not team:
+            await ctx.send("❌ Vous n'avez pas d'équipe trio. Utilisez `!createteam @joueur1 @joueur2 Nom`")
+            return
+        
+        # Récupérer les noms des joueurs
+        captain = ctx.guild.get_member(int(team['captain_id']))
+        player2 = ctx.guild.get_member(int(team['player2_id']))
+        player3 = ctx.guild.get_member(int(team['player3_id']))
+        
+        captain_name = captain.display_name if captain else f"ID:{team['captain_id']}"
+        player2_name = player2.display_name if player2 else f"ID:{team['player2_id']}"
+        player3_name = player3.display_name if player3 else f"ID:{team['player3_id']}"
+        
+        message = f"👥 **Équipe: {team['name']}**\n"
+        message += f"👑 Capitaine: {captain_name}\n"
+        message += f"👤 Équipiers: {player2_name}, {player3_name}\n"
+        message += f"📅 Créée: {team['created_at'].strftime('%d/%m/%Y')}\n\n"
+        message += f"💡 Rejoignez des lobbies trio avec `!trio <code>`"
+        
+        await ctx.send(message)
+    #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Bot ELO Dual - COMMANDES SÉPARÉES SOLO ET TRIO
@@ -1759,70 +1825,5 @@ async def setup_commands(bot):
         
         if dodge_count > 0:
             message += f"\n🚨 Dodges: {dodge_count}"
-        
-        await ctx.send(message)
-    
-    # Classements séparés
-    @bot.command(name='topsolo')
-    async def _leaderboard_solo(ctx):
-        from main import get_leaderboard, get_player
-        
-        players = get_leaderboard('solo')[:10]
-        if not players:
-            await ctx.send("📊 Classement solo vide")
-            return
-        
-        message = "🥇 **CLASSEMENT SOLO**\n\n"
-        
-        for i, player in enumerate(players, 1):
-            try:
-                member = ctx.guild.get_member(int(player['discord_id']))
-                name = member.display_name if member else player['name']
-            except:
-                name = player['name']
-            
-            winrate = round(player['solo_wins'] / max(1, player['solo_wins'] + player['solo_losses']) * 100, 1)
-            emoji = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-            message += f"{emoji} {name} - {player['solo_elo']} ELO ({winrate}%)\n"
-        
-        # Position joueur actuel
-        current_player = get_player(ctx.author.id)
-        if current_player:
-            all_players = get_leaderboard('solo')
-            pos = next((i for i, p in enumerate(all_players, 1) if p['discord_id'] == str(ctx.author.id)), None)
-            if pos:
-                message += f"\n**Votre position:** #{pos} - {current_player['solo_elo']} ELO"
-        
-        await ctx.send(message)
-    
-    @bot.command(name='toptrio')
-    async def _leaderboard_trio(ctx):
-        from main import get_leaderboard, get_player
-        
-        players = get_leaderboard('trio')[:10]
-        if not players:
-            await ctx.send("📊 Classement trio vide")
-            return
-        
-        message = "👥 **CLASSEMENT TRIO**\n\n"
-        
-        for i, player in enumerate(players, 1):
-            try:
-                member = ctx.guild.get_member(int(player['discord_id']))
-                name = member.display_name if member else player['name']
-            except:
-                name = player['name']
-            
-            winrate = round(player['trio_wins'] / max(1, player['trio_wins'] + player['trio_losses']) * 100, 1)
-            emoji = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-            message += f"{emoji} {name} - {player['trio_elo']} ELO ({winrate}%)\n"
-        
-        # Position joueur actuel
-        current_player = get_player(ctx.author.id)
-        if current_player:
-            all_players = get_leaderboard('trio')
-            pos = next((i for i, p in enumerate(all_players, 1) if p['discord_id'] == str(ctx.author.id)), None)
-            if pos:
-                message += f"\n**Votre position:** #{pos} - {current_player['trio_elo']} ELO"
         
         await ctx.send(message)
