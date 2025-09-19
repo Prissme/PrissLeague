@@ -33,74 +33,7 @@ def save_match_history(winners, losers, winner_elo_changes, loser_elo_changes,
 # COMMANDES PRINCIPALES MODIFIÉES
 # ================================
 
-@bot.command(name='createteam')
-async def create_team_cmd(ctx, teammate1: discord.Member, teammate2: discord.Member, *, team_name: str):
-    """!createteam @joueur1 @joueur2 Nom de l'équipe - Créer une équipe trio"""
-    from commands_dual import ensure_player_has_ping_role
-    
-    if len(team_name) > 30:
-        await ctx.send("Nom d'équipe trop long (30 caractères max)")
-        return
-    
-    # Vérifier que tous les joueurs existent
-    for member in [ctx.author, teammate1, teammate2]:
-        player = get_player(member.id)
-        if not player:
-            create_player(member.id, member.display_name)
-        await ensure_player_has_ping_role(ctx.guild, member.id)
-    
-    # Créer l'équipe
-    success, msg = create_trio_team(ctx.author.id, teammate1.id, teammate2.id, team_name)
-    if success:
-        await ctx.send(f"Équipe Trio créée!\n"
-                      f"Nom: {team_name}\n"
-                      f"Capitaine: {ctx.author.display_name}\n"
-                      f"Équipiers: {teammate1.display_name}, {teammate2.display_name}\n\n"
-                      f"Vous pouvez maintenant rejoindre des lobbies trio avec `!trio <code>`")
-    else:
-        await ctx.send(f"{msg}")
-
-@bot.command(name='myteam')
-async def my_team_cmd(ctx):
-    """!myteam - Voir son équipe trio"""
-    team = get_player_trio_team(ctx.author.id)
-    if not team:
-        await ctx.send("Vous n'avez pas d'équipe trio. Utilisez `!createteam @joueur1 @joueur2 Nom`")
-        return
-    
-    # Récupérer les noms des joueurs
-    captain = ctx.guild.get_member(int(team['captain_id']))
-    player2 = ctx.guild.get_member(int(team['player2_id']))
-    player3 = ctx.guild.get_member(int(team['player3_id']))
-    
-    captain_name = captain.display_name if captain else f"ID:{team['captain_id']}"
-    player2_name = player2.display_name if player2 else f"ID:{team['player2_id']}"
-    player3_name = player3.display_name if player3 else f"ID:{team['player3_id']}"
-    
-    message = f"Équipe: {team['name']}\n"
-    message += f"Capitaine: {captain_name}\n"
-    message += f"Équipiers: {player2_name}, {player3_name}\n"
-    message += f"Créée: {team['created_at'].strftime('%d/%m/%Y')}\n\n"
-    message += f"Rejoignez des lobbies trio avec `!trio <code>`"
-    
-    await ctx.send(message)
-
-@bot.command(name='dissolveteam')
-async def dissolve_team_cmd(ctx):
-    """!dissolveteam - Dissoudre son équipe trio (capitaine seulement)"""
-    team = get_player_trio_team(ctx.author.id)
-    if not team:
-        await ctx.send("Vous n'avez pas d'équipe trio")
-        return
-    
-    if team['captain_id'] != str(ctx.author.id):
-        await ctx.send("Seul le capitaine peut dissoudre l'équipe")
-        return
-    
-    if delete_trio_team(team['id']):
-        await ctx.send(f"Équipe '{team['name']}' dissoute")
-    else:
-        await ctx.send("Erreur lors de la dissolution")
+# Les commandes seront ajoutées dans setup_commands() dans commands_dual.py
 
 @bot.event
 async def on_ready():
