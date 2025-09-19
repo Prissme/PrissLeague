@@ -1,4 +1,627 @@
-#!/usr/bin/env python3
+await ctx.send(message)
+    
+    # Commandes lobbies séparées
+    @bot.command(name='soloqueue')
+    async def _list_solo_lobbies(ctx):
+        from main import MAX_CONCURRENT_LOBBIES_SOLO, LOBBY_COOLDOWN_MINUTES_SOLO
+        
+        conn = get_connection()
+        if not conn:
+            await ctx.send("❌ Erreur de connexion")
+            return
+        
+        try:
+            with conn.cursor() as c:
+                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'solo' ORDER BY created_at DESC")
+                lobbies = c.fetchall()
+                
+                # Cooldown
+                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 1")
+                result = c.fetchone()
+                
+                cooldown_active = False
+                if result:
+                    last_creation = result['last_creation']
+                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_SOLO)
+                    now = datetime.now()
+                    cooldown_active = now < cooldown_end
+        finally:
+            conn.close()
+        
+        message = f"🥇 **LOBBIES SOLO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_SOLO})\n\n"
+        
+        if not lobbies:
+            message += "Aucun lobby solo actif\n"
+        else:
+            for lobby in lobbies:
+                players_count = len(lobby['players'].split(',')) if lobby['players'] else 0
+                status = "🟢" if players_count < 6 else "🔴"
+                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({players_count}/6)\n"
+        
+        if cooldown_active:
+            remaining = cooldown_end - datetime.now()
+            minutes = int(remaining.total_seconds() // 60)
+            seconds = int(remaining.total_seconds() % 60)
+            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
+        else:
+            message += "\n✅ Création possible"
+        
+        await ctx.send(message)
+    
+    @bot.command(name='trioqueue')
+    async def _list_trio_lobbies(ctx):
+        from main import MAX_CONCURRENT_LOBBIES_TRIO, LOBBY_COOLDOWN_MINUTES_TRIO
+        
+        conn = get_connection()
+        if not conn:
+            await ctx.send("❌ Erreur de connexion")
+            return
+        
+        try:
+            with conn.cursor() as c:
+                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'trio' ORDER BY created_at DESC")
+                lobbies = c.fetchall()
+                
+                # Cooldown
+                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 2")
+                result = c.fetchone()
+                
+                cooldown_active = False
+                if result:
+                    last_creation = result['last_creation']
+                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_TRIO)
+                    now = datetime.now()
+                    cooldown_active = now < cooldown_end
+        finally:
+            conn.close()
+        
+        message = f"👥 **LOBBIES TRIO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_TRIO})\n\n"
+        
+        if not lobbies:
+            message += "Aucun lobby trio actif\n"
+        else:
+            for lobby in lobbies:
+                teams_count = len(lobby['teams'].split(',')) if lobby['teams'] else 0
+                status = "🟢" if teams_count < 2 else "🔴"
+                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({teams_count}/2 équipes)\n"
+        
+        if cooldown_active:
+            remaining = cooldown_end - datetime.now()
+            minutes = int(remaining.total_seconds() // 60)
+            seconds = int(remaining.total_seconds() % 60)
+            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
+        else:
+            message += "\n✅ Création possible"
+        
+        await ctx.send(message)
+    
+    # Commandes équipe
+    @bot.command(name='createteam')
+    async def _create_team(ctx, teammate1: discord.Member, teammate2: discord.Member, *, team_name: str):
+        from main import get_player, create_player, create_trio_team
+        
+        if len(team_name) > 30:
+            await ctx.send("❌ Nom d'équipe trop long (30 caractères max)")
+            return
+        
+        # Vérifier que tous les joueurs existent
+        for member in [ctx.author, teammate1, teammate2]:
+            player = get_player(member.id)
+            if not player:
+                create_player(member.id, member.display_name)
+            await ensure_player_has_ping_role(ctx.guild, member.id)
+        
+        # Créer l'équipe
+        success, msg = create_trio_team(ctx.author.id, teammate1.id, teammate2.id, team_name)
+        if success:
+            await ctx.send(f"✅ **Équipe Trio créée!**\n"
+                          f"📝 Nom: {team_name}\n"
+                          f"👑 Capitaine: {ctx.author.display_name}\n"
+                          f"👥 Équipiers: {teammate1.display_name}, {teammate2.display_name}\n\n"
+                          f"Vous pouvez maintenant rejoindre des lobbies trio avec `!trio <code>`")
+        else:
+            await ctx.send(f"❌ {msg}")
+    
+    @bot.command(name='myteam')
+    async def _my_team(ctx):
+        from main import get_player_trio_team
+        
+        team = get_player_trio_team(ctx.author.id)
+        if not team:
+            await ctx.send("❌ Vous n'avez pas d'équipe trio. Utilisez `!createteam @joueur1 @joueur2 Nom`")
+            return
+        
+        # Récupérer les noms des joueurs
+        captain = ctx.guild.get_member(int(team['captain_id']))
+        player2 = ctx.guild.get_member(int(team['player2_id']))
+        player3 = ctx.guild.get_member(int(team['player3_id']))
+        
+        captain_name = captain.display_name if captain else f"ID:{team['captain_id']}"
+        player2_name = player2.display_name if player2 else f"ID:{team['player2_id']}"
+        player3_name = player3.display_name if player3 else f"ID:{team['player3_id']}"
+        
+        message = f"👥 **Équipe: {team['name']}**\n"
+        message += f"👑 Capitaine: {captain_name}\n"
+        message += f"👤 Équipiers: {player2_name}, {player3_name}\n"
+        message += f"📅 Créée: {team['created_at'].strftime('%d/%m/%Y')}\n\n"
+        message += f"💡 Rejoignez des lobbies trio avec `!trio <code>`"
+        
+        await ctx.send(message)
+    
+    @bot.command(name='dissolveteam')
+    async def _dissolve_team(ctx):
+        from main import get_player_trio_team, delete_trio_team
+        
+        team = get_player_trio_team(ctx.author.id)
+        if not team:
+            await ctx.send("❌ Vous n'avez pas d'équipe trio")
+            return
+        
+        if team['captain_id'] != str(ctx.author.id):
+            await ctx.send("❌ Seul le capitaine peut dissoudre l'équipe")
+            return
+        
+        if delete_trio_team(team['id']):
+            await ctx.send(f"💥 **Équipe '{team['name']}' dissoute**")
+        else:
+            await ctx.send("❌ Erreur lors de la dissolution")
+    
+    # Commandes anciennes redirigées
+    @bot.command(name='create')
+    async def _create_redirect(ctx, room_code: str = None):
+        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
+                      "🥇 **Mode Solo:** `!solo <code>` puis `!joinsolo <id>`\n"
+                      "👥 **Mode Trio:** `!trio <code>` puis `!jointrio <id>`\n\n"
+                      "Pour le trio, créez d'abord votre équipe: `!createteam @joueur1 @joueur2 Nom`")
+    
+    @bot.command(name='join')
+    async def _join_redirect(ctx, lobby_id: int = None):
+        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
+                      "🥇 **Rejoindre Solo:** `!joinsolo <id>`\n"
+                      "👥 **Rejoindre Trio:** `!jointrio <id>`\n\n"
+                      "Voir les lobbies: `!soloqueue` ou `!trioqueue`")
+    
+    @bot.command(name='elo')
+    async def _elo_redirect(ctx):
+        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
+                      "🥇 **ELO Solo:** `!elosolo`\n"
+                      "👥 **ELO Trio:** `!elotrio`\n\n"
+                      "Classements: `!topsolo` ou `!toptrio`")
+    
+    @bot.command(name='leaderboard')
+    async def _leaderboard_redirect(ctx):
+        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
+                      "🥇 **Classement Solo:** `!topsolo`\n"
+                      "👥 **Classement Trio:** `!toptrio`")
+    
+    @bot.command(name='lobbies')
+    async def _lobbies_redirect(ctx):
+        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
+                      "🥇 **Queue Solo:** `!soloqueue`\n"
+                      "👥 **Queue Trio:** `!trioqueue`")
+    
+    # Commande help dual
+    @bot.command(name='help')
+    async def _help_dual(ctx):
+        message = "🎯 **BOT ELO DUAL - GUIDE COMPLET**\n\n"
+        
+        message += "🥇 **MODE SOLO (Matchmaking individuel)**\n"
+        message += "• `!solo <code>` - Créer un lobby solo\n"
+        message += "• `!joinsolo <id>` - Rejoindre un lobby solo\n"
+        message += "• `!soloqueue` - Voir les lobbies solo\n"
+        message += "• `!elosolo` - Voir son ELO solo\n"
+        message += "• `!topsolo` - Classement solo\n\n"
+        
+        message += "👥 **MODE TRIO (Équipes fixes)**\n"
+        message += "• `!createteam @joueur1 @joueur2 Nom` - Créer équipe\n"
+        message += "• `!myteam` - Voir son équipe\n"
+        message += "• `!dissolveteam` - Dissoudre équipe (capitaine)\n"
+        message += "• `!trio <code>` - Créer lobby trio\n"
+        message += "• `!jointrio <id>` - Rejoindre lobby trio\n"
+        message += "• `!trioqueue` - Voir lobbies trio\n"
+        message += "• `!elotrio` - Voir son ELO trio\n"
+        message += "• `!toptrio` - Classement trio\n\n"
+        
+        message += "🚫 **IMPORTANT:**\n"
+        message += "• ELO Solo et Trio sont **complètement séparés**\n"
+        message += "• Aucun mélange entre les deux modes\n"
+        message += "• Classements et stats indépendants\n"
+        message += "• Pour le trio, créez d'abord votre équipe fixe"
+        
+        await ctx.send(message)
+    
+    # Commandes admin modifiées pour dual
+    @bot.command(name='resetcd')
+    async def _resetcd(ctx):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        from main import LOBBY_COOLDOWN_MINUTES_SOLO, LOBBY_COOLDOWN_MINUTES_TRIO
+        conn = get_connection()
+        if conn:
+            try:
+                with conn.cursor() as c:
+                    c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP - INTERVAL %s WHERE id = 1', 
+                             (f"{LOBBY_COOLDOWN_MINUTES_SOLO + 1} minutes",))
+                    c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP - INTERVAL %s WHERE id = 2', 
+                             (f"{LOBBY_COOLDOWN_MINUTES_TRIO + 1} minutes",))
+                    conn.commit()
+                await ctx.send("✅ Cooldowns solo et trio reset!")
+            except Exception as e:
+                await ctx.send(f"❌ Erreur: {e}")
+            finally:
+                conn.close()
+    
+    @bot.command(name='clearlobbies')
+    async def _clearlobbies(ctx):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        conn = get_connection()
+        if conn:
+            try:
+                with conn.cursor() as c:
+                    c.execute('SELECT COUNT(*) as count FROM lobbies')
+                    count = c.fetchone()['count']
+                    c.execute('DELETE FROM lobbies')
+                    conn.commit()
+                await ctx.send(f"🗑️ {count} lobby(s) supprimé(s)")
+            except Exception as e:
+                await ctx.send(f"❌ Erreur: {e}")
+            finally:
+                conn.close()
+    
+    @bot.command(name='undosolo')
+    async def _undo_solo(ctx):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        success, result = undo_last_match_by_type('solo')
+        if success:
+            message = f"🔄 **MATCH SOLO ANNULÉ!**\n"
+            message += f"Gagnants: {', '.join(result['winners'])}\n"
+            message += f"Perdants: {', '.join(result['losers'])}\n"
+            message += f"✅ Changements ELO inversés"
+            if result['had_dodge']:
+                message += f"\n🚨 Dodge annulé"
+        else:
+            message = f"❌ Erreur: {result}"
+        await ctx.send(message)
+    
+    @bot.command(name='undotrio')
+    async def _undo_trio(ctx):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        success, result = undo_last_match_by_type('trio')
+        if success:
+            message = f"🔄 **MATCH TRIO ANNULÉ!**\n"
+            message += f"Gagnants: {', '.join(result['winners'])}\n"
+            message += f"Perdants: {', '.join(result['losers'])}\n"
+            message += f"✅ Changements ELO inversés"
+            if result['had_dodge']:
+                message += f"\n🚨 Dodge annulé"
+        else:
+            message = f"❌ Erreur: {result}"
+        await ctx.send(message)
+    
+    @bot.command(name='undo')
+    async def _undo_redirect(ctx):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        await ctx.send("🎯 **COMMANDES UNDO SÉPARÉES**\n\n"
+                      "🥇 **Annuler match solo:** `!undosolo`\n"
+                      "👥 **Annuler match trio:** `!undotrio`")
+    
+    @bot.command(name='addelo')
+    async def _addelo(ctx, member: discord.Member = None, amount: int = None, elo_type: str = "solo"):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        if not member or not amount or amount <= 0:
+            await ctx.send("❌ Usage: !addelo @joueur montant [solo/trio]")
+            return
+        
+        if elo_type not in ['solo', 'trio']:
+            elo_type = 'solo'
+        
+        from main import get_player, create_player
+        player = get_player(member.id)
+        if not player:
+            create_player(member.id, member.display_name)
+            player = get_player(member.id)
+        
+        await ensure_player_has_ping_role(ctx.guild, member.id)
+        
+        elo_field = f'{elo_type}_elo'
+        old_elo = player[elo_field]
+        new_elo = old_elo + amount
+        
+        conn = get_connection()
+        if conn:
+            try:
+                with conn.cursor() as c:
+                    c.execute(f'UPDATE players SET {elo_field} = %s WHERE discord_id = %s', 
+                             (new_elo, str(member.id)))
+                    conn.commit()
+                await ctx.send(f"✅ {member.display_name} ({elo_type.upper()}): {old_elo} → {new_elo} (+{amount})")
+            except Exception as e:
+                await ctx.send(f"❌ Erreur: {e}")
+            finally:
+                conn.close()
+    
+    @bot.command(name='removeelo')
+    async def _removeelo(ctx, member: discord.Member = None, amount: int = None, elo_type: str = "solo"):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        if not member or not amount or amount <= 0:
+            await ctx.send("❌ Usage: !removeelo @joueur montant [solo/trio]")
+            return
+        
+        if elo_type not in ['solo', 'trio']:
+            elo_type = 'solo'
+        
+        from main import get_player, create_player
+        player = get_player(member.id)
+        if not player:
+            create_player(member.id, member.display_name)
+            player = get_player(member.id)
+        
+        await ensure_player_has_ping_role(ctx.guild, member.id)
+        
+        elo_field = f'{elo_type}_elo'
+        old_elo = player[elo_field]
+        new_elo = max(0, old_elo - amount)
+        actual_removed = old_elo - new_elo
+        
+        conn = get_connection()
+        if conn:
+            try:
+                with conn.cursor() as c:
+                    c.execute(f'UPDATE players SET {elo_field} = %s WHERE discord_id = %s', 
+                             (new_elo, str(member.id)))
+                    conn.commit()
+                message = f"✅ {member.display_name} ({elo_type.upper()}): {old_elo} → {new_elo} (-{actual_removed})"
+                if actual_removed < amount:
+                    message += f" (min 0)"
+                await ctx.send(message)
+            except Exception as e:
+                await ctx.send(f"❌ Erreur: {e}")
+            finally:
+                conn.close()
+    
+    @bot.command(name='assignroles')
+    async def _assignroles(ctx):
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        
+        assigned = await assign_ping_role_to_all_players(ctx.guild)
+        await ctx.send(f"🎯 {assigned} rôles ping attribués aux joueurs en base!")
+    
+    # Commandes slash admin dual
+    @app_commands.command(name="resultsolo", description="Enregistrer un match solo manuellement (admin)")
+    @app_commands.describe(
+        gagnant1="Premier gagnant", gagnant2="Deuxième gagnant", gagnant3="Troisième gagnant",
+        perdant1="Premier perdant", perdant2="Deuxième perdant", perdant3="Troisième perdant",
+        dodge_joueur="Joueur qui a dodge (optionnel)", score="Score du match (optionnel)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.choices(score=[
+        app_commands.Choice(name="2-0", value="2-0"),
+        app_commands.Choice(name="2-1", value="2-1")
+    ])
+    async def _result_solo(interaction, gagnant1: discord.Member, gagnant2: discord.Member,
+                          gagnant3: discord.Member, perdant1: discord.Member, perdant2: discord.Member,
+                          perdant3: discord.Member, dodge_joueur: Optional[discord.Member] = None,
+                          score: Optional[Literal["2-0", "2-1"]] = None):
+        await record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
+                                       perdant1, perdant2, perdant3, dodge_joueur, score, 'solo')
+    
+    @app_commands.command(name="resulttrio", description="Enregistrer un match trio manuellement (admin)")
+    @app_commands.describe(
+        gagnant1="Premier gagnant", gagnant2="Deuxième gagnant", gagnant3="Troisième gagnant",
+        perdant1="Premier perdant", perdant2="Deuxième perdant", perdant3="Troisième perdant",
+        dodge_joueur="Joueur qui a dodge (optionnel)", score="Score du match (optionnel)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.choices(score=[
+        app_commands.Choice(name="2-0", value="2-0"),
+        app_commands.Choice(name="2-1", value="2-1")
+    ])
+    async def _result_trio(interaction, gagnant1: discord.Member, gagnant2: discord.Member,
+                          gagnant3: discord.Member, perdant1: discord.Member, perdant2: discord.Member,
+                          perdant3: discord.Member, dodge_joueur: Optional[discord.Member] = None,
+                          score: Optional[Literal["2-0", "2-1"]] = None):
+        await record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
+                                       perdant1, perdant2, perdant3, dodge_joueur, score, 'trio')
+    
+    bot.tree.add_command(_result_solo)
+    bot.tree.add_command(_result_trio)
+    
+    # Event handler pour annulation avec type
+    @bot.event
+    async def on_raw_reaction_add(payload):
+        if payload.user_id == bot.user.id:
+            return
+        
+        if str(payload.emoji) != "↩️" or payload.channel_id != MATCH_SUMMARY_CHANNEL_ID:
+            return
+        
+        # Vérifier si c'est un message de match
+        conn = get_connection()
+        if not conn:
+            return
+        
+        try:
+            with conn.cursor() as c:
+                c.execute('SELECT match_type FROM match_messages WHERE message_id = %s', (payload.message_id,))
+                result = c.fetchone()
+                if not result:
+                    return
+                
+                match_type = result['match_type']
+        finally:
+            conn.close()
+        
+        # Vérifier permissions admin
+        guild = payload.member.guild if payload.member else None
+        if not guild:
+            return
+        
+        member = guild.get_member(payload.user_id)
+        if not member or not member.guild_permissions.administrator:
+            return
+        
+        # Annuler le match selon le type
+        success, result = undo_last_match_by_type(match_type)
+        if success:
+            channel = guild.get_channel(payload.channel_id)
+            if channel:
+                try:
+                    message = await channel.fetch_message(payload.message_id)
+                    mode_name = "SOLO" if match_type == 'solo' else "TRIO"
+                    cancel_msg = f"❌ **MATCH {mode_name} ANNULÉ** par {member.display_name}\n\n"
+                    cancel_msg += f"🔄 Gagnants: {', '.join(result['winners'])}\n"
+                    cancel_msg += f"🔄 Perdants: {', '.join(result['losers'])}\n"
+                    cancel_msg += "📊 Changements ELO annulés"
+                    
+                    if result['had_dodge']:
+                        cancel_msg += "\n🚨 Dodge annulé"
+                    
+                    await message.edit(content=cancel_msg)
+                    await message.clear_reactions()
+                    
+                    # Retirer de la liste
+                    conn = get_connection()
+                    if conn:
+                        try:
+                            with conn.cursor() as c:
+                                c.execute('DELETE FROM match_messages WHERE message_id = %s', (payload.message_id,))
+                                conn.commit()
+                        finally:
+                            conn.close()
+                except:
+                    pass
+    
+    print("✅ Système ELO Dual configuré avec succès!")
+    print("🥇 Mode SOLO - Matchmaking individuel")
+    print("👥 Mode TRIO - Équipes fixes de 3 joueurs") 
+    print("🚫 ELO et classements complètement séparés")
+    print("📊 Aucun mélange entre les modes")
+    print(f"📺 Salon votes: {RESULT_CHANNEL_ID}")
+    print(f"📋 Salon résumés: {MATCH_SUMMARY_CHANNEL_ID}")
+    print("🎯 Commandes principales: !help pour la liste complète")
+
+# ================================
+# FONCTION ADMIN MATCH MANUEL
+# ================================
+
+async def record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
+                                   perdant1, perdant2, perdant3, dodge_joueur=None, score=None, match_type='solo'):
+    """Enregistrement manuel de match par admin selon le type"""
+    from main import (get_player, create_player, update_player_elo, calculate_elo_change,
+                     calculate_dodge_penalty, save_match_history)
+    
+    await interaction.response.send_message("⏳ Traitement...", ephemeral=True)
+    
+    winners = [gagnant1, gagnant2, gagnant3]
+    losers = [perdant1, perdant2, perdant3]
+    all_members = winners + losers
+    
+    # Vérifications
+    if len(set(m.id for m in all_members)) != 6:
+        await interaction.edit_original_response(content="❌ Chaque joueur ne peut apparaître qu'une fois")
+        return
+    
+    if dodge_joueur and dodge_joueur not in all_members:
+        await interaction.edit_original_response(content="❌ Le dodger doit faire partie des 6 joueurs")
+        return
+    
+    # Créer/vérifier joueurs et attribuer rôles
+    for member in all_members:
+        if not get_player(member.id):
+            create_player(member.id, member.display_name)
+        await ensure_player_has_ping_role(interaction.guild, member.id)
+    
+    # Gestion dodge
+    dodge_penalty = 0
+    if dodge_joueur:
+        record_dodge(dodge_joueur.id, match_type)
+        dodge_penalty = calculate_dodge_penalty(get_player_dodge_count(dodge_joueur.id, match_type))
+    
+    # Calculer ELO selon le type
+    elo_field = f'{match_type}_elo'
+    winner_elos = [get_player(m.id)[elo_field] for m in winners]
+    loser_elos = [get_player(m.id)[elo_field] for m in losers]
+    winner_avg = sum(winner_elos) / 3
+    loser_avg = sum(loser_elos) / 3
+    
+    winner_changes, loser_changes = [], []
+    
+    # Appliquer changements
+    for i, member in enumerate(winners):
+        old_elo = winner_elos[i]
+        change = calculate_elo_change(old_elo, loser_avg, True)
+        if dodge_joueur:
+            change = int(change * 0.8)
+        new_elo = max(0, old_elo + change)
+        update_player_elo(member.id, new_elo, True, match_type)
+        winner_changes.append(change)
+    
+    for i, member in enumerate(losers):
+        old_elo = loser_elos[i]
+        change = calculate_elo_change(old_elo, winner_avg, False)
+        
+        if dodge_joueur and member.id == dodge_joueur.id:
+            change -= dodge_penalty
+        elif dodge_joueur:
+            change = int(change * 0.3)
+        
+        new_elo = max(0, old_elo + change)
+        update_player_elo(member.id, new_elo, False, match_type)
+        loser_changes.append(change)
+    
+    # Sauvegarder historique
+    save_match_history(winners, losers, winner_changes, loser_changes,
+                      dodge_joueur.id if dodge_joueur else None, match_type)
+    
+    # Construire résumé
+    mode_emoji = "🥇" if match_type == 'solo' else "👥"
+    mode_name = match_type.upper()
+    
+    message = f"{mode_emoji} **RÉSULTAT MATCH {mode_name}** (Admin)\n\n"
+    if score:
+        message += f"Score: {score}\n"
+    if dodge_joueur:
+        message += f"🚨 Dodge: {dodge_joueur.display_name} (-{dodge_penalty})\n"
+    
+    message += "\n🏆 **GAGNANTS:**\n"
+    for i, member in enumerate(winners):
+        old_elo = winner_elos[i]
+        change = winner_changes[i]
+        message += f"{member.display_name}: {old_elo} → {old_elo + change} (+{change})\n"
+    
+    message += "\n💀 **PERDANTS:**\n"
+    for i, member in enumerate(losers):
+        old_elo = loser_elos[i]
+        change = loser_changes[i]
+        suffix = " [DODGE]" if dodge_joueur and member.id == dodge_joueur.id else " [Protégé]" if dodge_joueur else ""
+        message += f"{member.display_name}: {old_elo} → {old_elo + change} ({change:+}){suffix}\n"
+    
+    message += f"\n📊 ELO moyen: G{round(winner_avg)} | P{round(loser_avg)}"
+    message += "\n↩️ *Réagissez ↩️ pour annuler*"
+    
+    # Envoyer résumé
+    summary_channel = interaction.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
+    if summary_channel:
+        summary_msg = await summary_channel.send(message)
+        await summary_msg.add_reaction("↩️")
+        save_match_message_id(summary_msg.id, match_type)
+    
+    await interaction.edit_original_response(content="✅ Match enregistré!")#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Bot ELO Dual - COMMANDES SÉPARÉES SOLO ET TRIO
@@ -693,11 +1316,17 @@ class DodgeSelect(discord.ui.Select):
                     await self.handle_confirmed_dodge(player_id)
                     return
             
+            reported_member = self.vote_view.guild.get_member(reported_id)
+            reported_name = reported_member.display_name if reported_member else f"Joueur {reported_id}"
+            
             await self.vote_view.safe_respond(
                 interaction, 
                 f"✅ {reported_name} signalé pour dodge", 
                 ephemeral=True
             )
+            
+            await self.vote_view._update_message(self.vote_view._build_message())
+            
         except Exception as e:
             print(f"Erreur DodgeSelect callback: {e}")
             await self.vote_view.safe_respond(
@@ -1197,632 +1826,3 @@ async def setup_commands(bot):
                 message += f"\n**Votre position:** #{pos} - {current_player['trio_elo']} ELO"
         
         await ctx.send(message)
-    
-    # Commandes lobbies séparées
-    @bot.command(name='soloqueue')
-    async def _list_solo_lobbies(ctx):
-        from main import MAX_CONCURRENT_LOBBIES_SOLO, LOBBY_COOLDOWN_MINUTES_SOLO
-        
-        conn = get_connection()
-        if not conn:
-            await ctx.send("❌ Erreur de connexion")
-            return
-        
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'solo' ORDER BY created_at DESC")
-                lobbies = c.fetchall()
-                
-                # Cooldown
-                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 1")
-                result = c.fetchone()
-                
-                cooldown_active = False
-                if result:
-                    last_creation = result['last_creation']
-                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_SOLO)
-                    now = datetime.now()
-                    cooldown_active = now < cooldown_end
-        finally:
-            conn.close()
-        
-        message = f"🥇 **LOBBIES SOLO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_SOLO})\n\n"
-        
-        if not lobbies:
-            message += "Aucun lobby solo actif\n"
-        else:
-            for lobby in lobbies:
-                players_count = len(lobby['players'].split(',')) if lobby['players'] else 0
-                status = "🟢" if players_count < 6 else "🔴"
-                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({players_count}/6)\n"
-        
-        if cooldown_active:
-            remaining = cooldown_end - datetime.now()
-            minutes = int(remaining.total_seconds() // 60)
-            seconds = int(remaining.total_seconds() % 60)
-            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
-        else:
-            message += "\n✅ Création possible"
-        
-        await ctx.send(message)
-    
-    @bot.command(name='trioqueue')
-    async def _list_trio_lobbies(ctx):
-        from main import MAX_CONCURRENT_LOBBIES_TRIO, LOBBY_COOLDOWN_MINUTES_TRIO
-        
-        conn = get_connection()
-        if not conn:
-            await ctx.send("❌ Erreur de connexion")
-            return
-        
-        try:
-            with conn.cursor() as c:
-                c.execute("SELECT * FROM lobbies WHERE lobby_type = 'trio' ORDER BY created_at DESC")
-                lobbies = c.fetchall()
-                
-                # Cooldown
-                c.execute("SELECT last_creation FROM lobby_cooldown WHERE id = 2")
-                result = c.fetchone()
-                
-                cooldown_active = False
-                if result:
-                    last_creation = result['last_creation']
-                    cooldown_end = last_creation + timedelta(minutes=LOBBY_COOLDOWN_MINUTES_TRIO)
-                    now = datetime.now()
-                    cooldown_active = now < cooldown_end
-        finally:
-            conn.close()
-        
-        message = f"👥 **LOBBIES TRIO** ({len(lobbies)}/{MAX_CONCURRENT_LOBBIES_TRIO})\n\n"
-        
-        if not lobbies:
-            message += "Aucun lobby trio actif\n"
-        else:
-            for lobby in lobbies:
-                teams_count = len(lobby['teams'].split(',')) if lobby['teams'] else 0
-                status = "🟢" if teams_count < 2 else "🔴"
-                message += f"{status} #{lobby['id']} - {lobby['room_code']} ({teams_count}/2 équipes)\n"
-        
-        if cooldown_active:
-            remaining = cooldown_end - datetime.now()
-            minutes = int(remaining.total_seconds() // 60)
-            seconds = int(remaining.total_seconds() % 60)
-            message += f"\n⏰ Cooldown: {minutes}m {seconds}s"
-        else:
-            message += "\n✅ Création possible"
-        
-        await ctx.send(message)
-    
-    # Commandes équipe
-    @bot.command(name='createteam')
-    async def _create_team(ctx, teammate1: discord.Member, teammate2: discord.Member, *, team_name: str):
-        from main import get_player, create_player, create_trio_team
-        
-        if len(team_name) > 30:
-            await ctx.send("❌ Nom d'équipe trop long (30 caractères max)")
-            return
-        
-        # Vérifier que tous les joueurs existent
-        for member in [ctx.author, teammate1, teammate2]:
-            player = get_player(member.id)
-            if not player:
-                create_player(member.id, member.display_name)
-            await ensure_player_has_ping_role(ctx.guild, member.id)
-        
-        # Créer l'équipe
-        success, msg = create_trio_team(ctx.author.id, teammate1.id, teammate2.id, team_name)
-        if success:
-            await ctx.send(f"✅ **Équipe Trio créée!**\n"
-                          f"📝 Nom: {team_name}\n"
-                          f"👑 Capitaine: {ctx.author.display_name}\n"
-                          f"👥 Équipiers: {teammate1.display_name}, {teammate2.display_name}\n\n"
-                          f"Vous pouvez maintenant rejoindre des lobbies trio avec `!trio <code>`")
-        else:
-            await ctx.send(f"❌ {msg}")
-    
-    @bot.command(name='myteam')
-    async def _my_team(ctx):
-        from main import get_player_trio_team
-        
-        team = get_player_trio_team(ctx.author.id)
-        if not team:
-            await ctx.send("❌ Vous n'avez pas d'équipe trio. Utilisez `!createteam @joueur1 @joueur2 Nom`")
-            return
-        
-        # Récupérer les noms des joueurs
-        captain = ctx.guild.get_member(int(team['captain_id']))
-        player2 = ctx.guild.get_member(int(team['player2_id']))
-        player3 = ctx.guild.get_member(int(team['player3_id']))
-        
-        captain_name = captain.display_name if captain else f"ID:{team['captain_id']}"
-        player2_name = player2.display_name if player2 else f"ID:{team['player2_id']}"
-        player3_name = player3.display_name if player3 else f"ID:{team['player3_id']}"
-        
-        message = f"👥 **Équipe: {team['name']}**\n"
-        message += f"👑 Capitaine: {captain_name}\n"
-        message += f"👤 Équipiers: {player2_name}, {player3_name}\n"
-        message += f"📅 Créée: {team['created_at'].strftime('%d/%m/%Y')}\n\n"
-        message += f"💡 Rejoignez des lobbies trio avec `!trio <code>`"
-        
-        await ctx.send(message)
-    
-    @bot.command(name='dissolveteam')
-    async def _dissolve_team(ctx):
-        from main import get_player_trio_team, delete_trio_team
-        
-        team = get_player_trio_team(ctx.author.id)
-        if not team:
-            await ctx.send("❌ Vous n'avez pas d'équipe trio")
-            return
-        
-        if team['captain_id'] != str(ctx.author.id):
-            await ctx.send("❌ Seul le capitaine peut dissoudre l'équipe")
-            return
-        
-        if delete_trio_team(team['id']):
-            await ctx.send(f"💥 **Équipe '{team['name']}' dissoute**")
-        else:
-            await ctx.send("❌ Erreur lors de la dissolution")
-    
-    # Commandes anciennes redirigées
-    @bot.command(name='create')
-    async def _create_redirect(ctx, room_code: str = None):
-        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
-                      "🥇 **Mode Solo:** `!solo <code>` puis `!joinsolo <id>`\n"
-                      "👥 **Mode Trio:** `!trio <code>` puis `!jointrio <id>`\n\n"
-                      "Pour le trio, créez d'abord votre équipe: `!createteam @joueur1 @joueur2 Nom`")
-    
-    @bot.command(name='join')
-    async def _join_redirect(ctx, lobby_id: int = None):
-        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
-                      "🥇 **Rejoindre Solo:** `!joinsolo <id>`\n"
-                      "👥 **Rejoindre Trio:** `!jointrio <id>`\n\n"
-                      "Voir les lobbies: `!soloqueue` ou `!trioqueue`")
-    
-    @bot.command(name='elo')
-    async def _elo_redirect(ctx):
-        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
-                      "🥇 **ELO Solo:** `!elosolo`\n"
-                      "👥 **ELO Trio:** `!elotrio`\n\n"
-                      "Classements: `!topsolo` ou `!toptrio`")
-    
-    @bot.command(name='leaderboard')
-    async def _leaderboard_redirect(ctx):
-        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
-                      "🥇 **Classement Solo:** `!topsolo`\n"
-                      "👥 **Classement Trio:** `!toptrio`")
-    
-    @bot.command(name='lobbies')
-    async def _lobbies_redirect(ctx):
-        await ctx.send("🎯 **NOUVEAU SYSTÈME DUAL**\n\n"
-                      "🥇 **Queue Solo:** `!soloqueue`\n"
-                      "👥 **Queue Trio:** `!trioqueue`")
-    
-    # Commande help dual
-    @bot.command(name='help')
-    async def _help_dual(ctx):
-        message = "🎯 **BOT ELO DUAL - GUIDE COMPLET**\n\n"
-        
-        message += "🥇 **MODE SOLO (Matchmaking individuel)**\n"
-        message += "• `!solo <code>` - Créer un lobby solo\n"
-        message += "• `!joinsolo <id>` - Rejoindre un lobby solo\n"
-        message += "• `!soloqueue` - Voir les lobbies solo\n"
-        message += "• `!elosolo` - Voir son ELO solo\n"
-        message += "• `!topsolo` - Classement solo\n\n"
-        
-        message += "👥 **MODE TRIO (Équipes fixes)**\n"
-        message += "• `!createteam @joueur1 @joueur2 Nom` - Créer équipe\n"
-        message += "• `!myteam` - Voir son équipe\n"
-        message += "• `!dissolveteam` - Dissoudre équipe (capitaine)\n"
-        message += "• `!trio <code>` - Créer lobby trio\n"
-        message += "• `!jointrio <id>` - Rejoindre lobby trio\n"
-        message += "• `!trioqueue` - Voir lobbies trio\n"
-        message += "• `!elotrio` - Voir son ELO trio\n"
-        message += "• `!toptrio` - Classement trio\n\n"
-        
-        message += "🚫 **IMPORTANT:**\n"
-        message += "• ELO Solo et Trio sont **complètement séparés**\n"
-        message += "• Aucun mélange entre les deux modes\n"
-        message += "• Classements et stats indépendants\n"
-        message += "• Pour le trio, créez d'abord votre équipe fixe"
-        
-        await ctx.send(message)
-    
-    # Commandes admin modifiées pour dual
-    @bot.command(name='resetcd')
-    async def _resetcd(ctx):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        from main import LOBBY_COOLDOWN_MINUTES_SOLO, LOBBY_COOLDOWN_MINUTES_TRIO
-        conn = get_connection()
-        if conn:
-            try:
-                with conn.cursor() as c:
-                    c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP - INTERVAL %s WHERE id = 1', 
-                             (f"{LOBBY_COOLDOWN_MINUTES_SOLO + 1} minutes",))
-                    c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP - INTERVAL %s WHERE id = 2', 
-                             (f"{LOBBY_COOLDOWN_MINUTES_TRIO + 1} minutes",))
-                    conn.commit()
-                await ctx.send("✅ Cooldowns solo et trio reset!")
-            except Exception as e:
-                await ctx.send(f"❌ Erreur: {e}")
-            finally:
-                conn.close()
-    
-    @bot.command(name='clearlobbies')
-    async def _clearlobbies(ctx):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        conn = get_connection()
-        if conn:
-            try:
-                with conn.cursor() as c:
-                    c.execute('SELECT COUNT(*) as count FROM lobbies')
-                    count = c.fetchone()['count']
-                    c.execute('DELETE FROM lobbies')
-                    conn.commit()
-                await ctx.send(f"🗑️ {count} lobby(s) supprimé(s)")
-            except Exception as e:
-                await ctx.send(f"❌ Erreur: {e}")
-            finally:
-                conn.close()
-    
-    @bot.command(name='undosolo')
-    async def _undo_solo(ctx):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        success, result = undo_last_match_by_type('solo')
-        if success:
-            message = f"🔄 **MATCH SOLO ANNULÉ!**\n"
-            message += f"Gagnants: {', '.join(result['winners'])}\n"
-            message += f"Perdants: {', '.join(result['losers'])}\n"
-            message += f"✅ Changements ELO inversés"
-            if result['had_dodge']:
-                message += f"\n🚨 Dodge annulé"
-        else:
-            message = f"❌ Erreur: {result}"
-        await ctx.send(message)
-    
-    @bot.command(name='undotrio')
-    async def _undo_trio(ctx):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        success, result = undo_last_match_by_type('trio')
-        if success:
-            message = f"🔄 **MATCH TRIO ANNULÉ!**\n"
-            message += f"Gagnants: {', '.join(result['winners'])}\n"
-            message += f"Perdants: {', '.join(result['losers'])}\n"
-            message += f"✅ Changements ELO inversés"
-            if result['had_dodge']:
-                message += f"\n🚨 Dodge annulé"
-        else:
-            message = f"❌ Erreur: {result}"
-        await ctx.send(message)
-    
-    @bot.command(name='undo')
-    async def _undo_redirect(ctx):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        await ctx.send("🎯 **COMMANDES UNDO SÉPARÉES**\n\n"
-                      "🥇 **Annuler match solo:** `!undosolo`\n"
-                      "👥 **Annuler match trio:** `!undotrio`")
-    
-    @bot.command(name='addelo')
-    async def _addelo(ctx, member: discord.Member = None, amount: int = None, elo_type: str = "solo"):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        if not member or not amount or amount <= 0:
-            await ctx.send("❌ Usage: !addelo @joueur montant [solo/trio]")
-            return
-        
-        if elo_type not in ['solo', 'trio']:
-            elo_type = 'solo'
-        
-        from main import get_player, create_player
-        player = get_player(member.id)
-        if not player:
-            create_player(member.id, member.display_name)
-            player = get_player(member.id)
-        
-        await ensure_player_has_ping_role(ctx.guild, member.id)
-        
-        elo_field = f'{elo_type}_elo'
-        old_elo = player[elo_field]
-        new_elo = old_elo + amount
-        
-        conn = get_connection()
-        if conn:
-            try:
-                with conn.cursor() as c:
-                    c.execute(f'UPDATE players SET {elo_field} = %s WHERE discord_id = %s', 
-                             (new_elo, str(member.id)))
-                    conn.commit()
-                await ctx.send(f"✅ {member.display_name} ({elo_type.upper()}): {old_elo} → {new_elo} (+{amount})")
-            except Exception as e:
-                await ctx.send(f"❌ Erreur: {e}")
-            finally:
-                conn.close()
-    
-    @bot.command(name='removeelo')
-    async def _removeelo(ctx, member: discord.Member = None, amount: int = None, elo_type: str = "solo"):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        if not member or not amount or amount <= 0:
-            await ctx.send("❌ Usage: !removeelo @joueur montant [solo/trio]")
-            return
-        
-        if elo_type not in ['solo', 'trio']:
-            elo_type = 'solo'
-        
-        from main import get_player, create_player
-        player = get_player(member.id)
-        if not player:
-            create_player(member.id, member.display_name)
-            player = get_player(member.id)
-        
-        await ensure_player_has_ping_role(ctx.guild, member.id)
-        
-        elo_field = f'{elo_type}_elo'
-        old_elo = player[elo_field]
-        new_elo = max(0, old_elo - amount)
-        actual_removed = old_elo - new_elo
-        
-        conn = get_connection()
-        if conn:
-            try:
-                with conn.cursor() as c:
-                    c.execute(f'UPDATE players SET {elo_field} = %s WHERE discord_id = %s', 
-                             (new_elo, str(member.id)))
-                    conn.commit()
-                message = f"✅ {member.display_name} ({elo_type.upper()}): {old_elo} → {new_elo} (-{actual_removed})"
-                if actual_removed < amount:
-                    message += f" (min 0)"
-                await ctx.send(message)
-            except Exception as e:
-                await ctx.send(f"❌ Erreur: {e}")
-            finally:
-                conn.close()
-    
-    @bot.command(name='assignroles')
-    async def _assignroles(ctx):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        
-        assigned = await assign_ping_role_to_all_players(ctx.guild)
-        await ctx.send(f"🎯 {assigned} rôles ping attribués aux joueurs en base!")
-    
-    # Commandes slash admin dual
-    @app_commands.command(name="resultsolo", description="Enregistrer un match solo manuellement (admin)")
-    @app_commands.describe(
-        gagnant1="Premier gagnant", gagnant2="Deuxième gagnant", gagnant3="Troisième gagnant",
-        perdant1="Premier perdant", perdant2="Deuxième perdant", perdant3="Troisième perdant",
-        dodge_joueur="Joueur qui a dodge (optionnel)", score="Score du match (optionnel)"
-    )
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.choices(score=[
-        app_commands.Choice(name="2-0", value="2-0"),
-        app_commands.Choice(name="2-1", value="2-1")
-    ])
-    async def _result_solo(interaction, gagnant1: discord.Member, gagnant2: discord.Member,
-                          gagnant3: discord.Member, perdant1: discord.Member, perdant2: discord.Member,
-                          perdant3: discord.Member, dodge_joueur: Optional[discord.Member] = None,
-                          score: Optional[Literal["2-0", "2-1"]] = None):
-        await record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
-                                       perdant1, perdant2, perdant3, dodge_joueur, score, 'solo')
-    
-    @app_commands.command(name="resulttrio", description="Enregistrer un match trio manuellement (admin)")
-    @app_commands.describe(
-        gagnant1="Premier gagnant", gagnant2="Deuxième gagnant", gagnant3="Troisième gagnant",
-        perdant1="Premier perdant", perdant2="Deuxième perdant", perdant3="Troisième perdant",
-        dodge_joueur="Joueur qui a dodge (optionnel)", score="Score du match (optionnel)"
-    )
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.choices(score=[
-        app_commands.Choice(name="2-0", value="2-0"),
-        app_commands.Choice(name="2-1", value="2-1")
-    ])
-    async def _result_trio(interaction, gagnant1: discord.Member, gagnant2: discord.Member,
-                          gagnant3: discord.Member, perdant1: discord.Member, perdant2: discord.Member,
-                          perdant3: discord.Member, dodge_joueur: Optional[discord.Member] = None,
-                          score: Optional[Literal["2-0", "2-1"]] = None):
-        await record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
-                                       perdant1, perdant2, perdant3, dodge_joueur, score, 'trio')
-    
-    bot.tree.add_command(_result_solo)
-    bot.tree.add_command(_result_trio)
-    
-    # Event handler pour annulation avec type
-    @bot.event
-    async def on_raw_reaction_add(payload):
-        if payload.user_id == bot.user.id:
-            return
-        
-        if str(payload.emoji) != "↩️" or payload.channel_id != MATCH_SUMMARY_CHANNEL_ID:
-            return
-        
-        # Vérifier si c'est un message de match
-        conn = get_connection()
-        if not conn:
-            return
-        
-        try:
-            with conn.cursor() as c:
-                c.execute('SELECT match_type FROM match_messages WHERE message_id = %s', (payload.message_id,))
-                result = c.fetchone()
-                if not result:
-                    return
-                
-                match_type = result['match_type']
-        finally:
-            conn.close()
-        
-        # Vérifier permissions admin
-        guild = payload.member.guild if payload.member else None
-        if not guild:
-            return
-        
-        member = guild.get_member(payload.user_id)
-        if not member or not member.guild_permissions.administrator:
-            return
-        
-        # Annuler le match selon le type
-        success, result = undo_last_match_by_type(match_type)
-        if success:
-            channel = guild.get_channel(payload.channel_id)
-            if channel:
-                try:
-                    message = await channel.fetch_message(payload.message_id)
-                    mode_name = "SOLO" if match_type == 'solo' else "TRIO"
-                    cancel_msg = f"❌ **MATCH {mode_name} ANNULÉ** par {member.display_name}\n\n"
-                    cancel_msg += f"🔄 Gagnants: {', '.join(result['winners'])}\n"
-                    cancel_msg += f"🔄 Perdants: {', '.join(result['losers'])}\n"
-                    cancel_msg += "📊 Changements ELO annulés"
-                    
-                    if result['had_dodge']:
-                        cancel_msg += "\n🚨 Dodge annulé"
-                    
-                    await message.edit(content=cancel_msg)
-                    await message.clear_reactions()
-                    
-                    # Retirer de la liste
-                    conn = get_connection()
-                    if conn:
-                        try:
-                            with conn.cursor() as c:
-                                c.execute('DELETE FROM match_messages WHERE message_id = %s', (payload.message_id,))
-                                conn.commit()
-                        finally:
-                            conn.close()
-                except:
-                    pass
-    
-    print("✅ Système ELO Dual configuré avec succès!")
-    print("🥇 Mode SOLO - Matchmaking individuel")
-    print("👥 Mode TRIO - Équipes fixes de 3 joueurs") 
-    print("🚫 ELO et classements complètement séparés")
-    print("📊 Aucun mélange entre les modes")
-    print(f"📺 Salon votes: {RESULT_CHANNEL_ID}")
-    print(f"📋 Salon résumés: {MATCH_SUMMARY_CHANNEL_ID}")
-    print("🎯 Commandes principales: !help pour la liste complète")
-
-# ================================
-# FONCTION ADMIN MATCH MANUEL
-# ================================
-
-async def record_manual_match_result(interaction, gagnant1, gagnant2, gagnant3,
-                                   perdant1, perdant2, perdant3, dodge_joueur=None, score=None, match_type='solo'):
-    """Enregistrement manuel de match par admin selon le type"""
-    from main import (get_player, create_player, update_player_elo, calculate_elo_change,
-                     calculate_dodge_penalty, save_match_history)
-    
-    await interaction.response.send_message("⏳ Traitement...", ephemeral=True)
-    
-    winners = [gagnant1, gagnant2, gagnant3]
-    losers = [perdant1, perdant2, perdant3]
-    all_members = winners + losers
-    
-    # Vérifications
-    if len(set(m.id for m in all_members)) != 6:
-        await interaction.edit_original_response(content="❌ Chaque joueur ne peut apparaître qu'une fois")
-        return
-    
-    if dodge_joueur and dodge_joueur not in all_members:
-        await interaction.edit_original_response(content="❌ Le dodger doit faire partie des 6 joueurs")
-        return
-    
-    # Créer/vérifier joueurs et attribuer rôles
-    for member in all_members:
-        if not get_player(member.id):
-            create_player(member.id, member.display_name)
-        await ensure_player_has_ping_role(interaction.guild, member.id)
-    
-    # Gestion dodge
-    dodge_penalty = 0
-    if dodge_joueur:
-        record_dodge(dodge_joueur.id, match_type)
-        dodge_penalty = calculate_dodge_penalty(get_player_dodge_count(dodge_joueur.id, match_type))
-    
-    # Calculer ELO selon le type
-    elo_field = f'{match_type}_elo'
-    winner_elos = [get_player(m.id)[elo_field] for m in winners]
-    loser_elos = [get_player(m.id)[elo_field] for m in losers]
-    winner_avg = sum(winner_elos) / 3
-    loser_avg = sum(loser_elos) / 3
-    
-    winner_changes, loser_changes = [], []
-    
-    # Appliquer changements
-    for i, member in enumerate(winners):
-        old_elo = winner_elos[i]
-        change = calculate_elo_change(old_elo, loser_avg, True)
-        if dodge_joueur:
-            change = int(change * 0.8)
-        new_elo = max(0, old_elo + change)
-        update_player_elo(member.id, new_elo, True, match_type)
-        winner_changes.append(change)
-    
-    for i, member in enumerate(losers):
-        old_elo = loser_elos[i]
-        change = calculate_elo_change(old_elo, winner_avg, False)
-        
-        if dodge_joueur and member.id == dodge_joueur.id:
-            change -= dodge_penalty
-        elif dodge_joueur:
-            change = int(change * 0.3)
-        
-        new_elo = max(0, old_elo + change)
-        update_player_elo(member.id, new_elo, False, match_type)
-        loser_changes.append(change)
-    
-    # Sauvegarder historique
-    save_match_history(winners, losers, winner_changes, loser_changes,
-                      dodge_joueur.id if dodge_joueur else None, match_type)
-    
-    # Construire résumé
-    mode_emoji = "🥇" if match_type == 'solo' else "👥"
-    mode_name = match_type.upper()
-    
-    message = f"{mode_emoji} **RÉSULTAT MATCH {mode_name}** (Admin)\n\n"
-    if score:
-        message += f"Score: {score}\n"
-    if dodge_joueur:
-        message += f"🚨 Dodge: {dodge_joueur.display_name} (-{dodge_penalty})\n"
-    
-    message += "\n🏆 **GAGNANTS:**\n"
-    for i, member in enumerate(winners):
-        old_elo = winner_elos[i]
-        change = winner_changes[i]
-        message += f"{member.display_name}: {old_elo} → {old_elo + change} (+{change})\n"
-    
-    message += "\n💀 **PERDANTS:**\n"
-    for i, member in enumerate(losers):
-        old_elo = loser_elos[i]
-        change = loser_changes[i]
-        suffix = " [DODGE]" if dodge_joueur and member.id == dodge_joueur.id else " [Protégé]" if dodge_joueur else ""
-        message += f"{member.display_name}: {old_elo} → {old_elo + change} ({change:+}){suffix}\n"
-    
-    message += f"\n📊 ELO moyen: G{round(winner_avg)} | P{round(loser_avg)}"
-    message += "\n↩️ *Réagissez ↩️ pour annuler*"
-    
-    # Envoyer résumé
-    summary_channel = interaction.guild.get_channel(MATCH_SUMMARY_CHANNEL_ID)
-    if summary_channel:
-        summary_msg = await summary_channel.send(message)
-        await summary_msg.add_reaction("↩️")
-        save_match_message_id(summary_msg.id, match_type)
-    
-    await interaction.edit_original_response(content="✅ Match enregistré!")
-._update_message(self.vote_view._build_message())
-            
-            reported_member = self.vote_view.guild.get_member(reported_id)
-            reported_name = reported_member.display_name if reported_member else f"Joueur {reported_id}"
-            
-            await self.vote_view
