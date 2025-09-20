@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Dual - FICHIER PRINCIPAL
-Configuration avec système Solo + Trio séparés avec migration automatique
+Configuration avec système Solo + Trio séparés avec migration complète
 """
 
 import discord
@@ -128,7 +128,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 atexit.register(cleanup_and_exit)
 
 # ================================
-# DATABASE POSTGRESQL - VERSION DUAL AVEC MIGRATION
+# DATABASE POSTGRESQL - MIGRATION COMPLÈTE
 # ================================
 
 def get_connection():
@@ -140,7 +140,7 @@ def get_connection():
         return None
 
 def init_db():
-    """Initialise la base de données PostgreSQL avec système dual et migration automatique"""
+    """Initialise et migre complètement la base vers le système dual"""
     conn = get_connection()
     if not conn:
         logger.error("Impossible de se connecter à la base de données")
@@ -148,7 +148,13 @@ def init_db():
     
     try:
         with conn.cursor() as c:
-            # Table joueurs avec ELO séparés Solo/Trio
+            print("🔧 MIGRATION COMPLÈTE VERS SYSTÈME DUAL")
+            print("=" * 50)
+            
+            # 1. MIGRATION TABLE PLAYERS
+            print("🔄 1/4 - Migration table players...")
+            
+            # Créer table players avec toutes les colonnes
             c.execute('''
                 CREATE TABLE IF NOT EXISTS players (
                     discord_id TEXT PRIMARY KEY,
@@ -166,6 +172,99 @@ def init_db():
                 )
             ''')
             
+            # Ajouter colonnes dual si manquantes
+            dual_columns = {
+                'solo_elo': 'INTEGER DEFAULT 1000',
+                'solo_wins': 'INTEGER DEFAULT 0',
+                'solo_losses': 'INTEGER DEFAULT 0',
+                'trio_elo': 'INTEGER DEFAULT 1000',
+                'trio_wins': 'INTEGER DEFAULT 0',
+                'trio_losses': 'INTEGER DEFAULT 0'
+            }
+            
+            for col_name, col_type in dual_columns.items():
+                try:
+                    c.execute(f'ALTER TABLE players ADD COLUMN {col_name} {col_type}')
+                    print(f"  ➤ Ajouté colonne {col_name}")
+                except psycopg2.errors.DuplicateColumn:
+                    pass
+                except Exception as e:
+                    if "already exists" not in str(e):
+                        print(f"  ⚠️ Erreur colonne {col_name}: {e}")
+            
+            # Migrer données existantes
+            c.execute('''
+                UPDATE players SET 
+                solo_elo = COALESCE(NULLIF(solo_elo, 1000), elo, 1000),
+                solo_wins = COALESCE(NULLIF(solo_wins, 0), wins, 0),
+                solo_losses = COALESCE(NULLIF(solo_losses, 0), losses, 0)
+                WHERE (solo_elo = 1000 OR solo_elo IS NULL)
+                AND (elo IS NOT NULL AND elo != 1000)
+            ''')
+            
+            c.execute('SELECT COUNT(*) as count FROM players WHERE solo_elo != 1000')
+            migrated_players = c.fetchone()['count']
+            print(f"  ✅ {migrated_players} joueurs migrés vers système dual")
+            
+            # 2. MIGRATION TABLE LOBBIES
+            print("🔄 2/4 - Migration table lobbies...")
+            
+            # Créer table lobbies complète
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS lobbies (
+                    id SERIAL PRIMARY KEY,
+                    room_code TEXT NOT NULL,
+                    lobby_type TEXT DEFAULT 'solo' CHECK (lobby_type IN ('solo', 'trio')),
+                    players TEXT DEFAULT '',
+                    teams TEXT DEFAULT '',
+                    max_players INTEGER DEFAULT 6,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Ajouter colonnes manquantes
+            lobby_columns = {
+                'lobby_type': "TEXT DEFAULT 'solo' CHECK (lobby_type IN ('solo', 'trio'))",
+                'teams': "TEXT DEFAULT ''"
+            }
+            
+            for col_name, col_type in lobby_columns.items():
+                try:
+                    c.execute(f'ALTER TABLE lobbies ADD COLUMN {col_name} {col_type}')
+                    print(f"  ➤ Ajouté colonne {col_name}")
+                except psycopg2.errors.DuplicateColumn:
+                    pass
+                except Exception as e:
+                    if "already exists" not in str(e):
+                        print(f"  ⚠️ Erreur colonne {col_name}: {e}")
+            
+            # Définir lobbies existants comme solo
+            c.execute("UPDATE lobbies SET lobby_type = 'solo' WHERE lobby_type IS NULL")
+            print("  ✅ Lobbies existants définis comme solo")
+            
+            # 3. MIGRATION TABLE LOBBY_COOLDOWN
+            print("🔄 3/4 - Migration table lobby_cooldown...")
+            
+            # Supprimer et recréer proprement
+            c.execute('DROP TABLE IF EXISTS lobby_cooldown CASCADE')
+            c.execute('''
+                CREATE TABLE lobby_cooldown (
+                    id INTEGER PRIMARY KEY,
+                    lobby_type TEXT NOT NULL CHECK (lobby_type IN ('solo', 'trio')),
+                    last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Insérer valeurs par défaut
+            c.execute('''
+                INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
+                VALUES (1, 'solo', CURRENT_TIMESTAMP), (2, 'trio', CURRENT_TIMESTAMP)
+            ''')
+            print("  ✅ Table lobby_cooldown recréée avec types dual")
+            
+            # 4. CRÉATION TABLES MANQUANTES
+            print("🔄 4/4 - Création tables système dual...")
+            
             # Table équipes trio
             c.execute('''
                 CREATE TABLE IF NOT EXISTS trio_teams (
@@ -178,28 +277,6 @@ def init_db():
                     FOREIGN KEY (captain_id) REFERENCES players(discord_id),
                     FOREIGN KEY (player2_id) REFERENCES players(discord_id),
                     FOREIGN KEY (player3_id) REFERENCES players(discord_id)
-                )
-            ''')
-            
-            # Table lobbies avec type (solo/trio)
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS lobbies (
-                    id SERIAL PRIMARY KEY,
-                    room_code TEXT NOT NULL,
-                    lobby_type TEXT NOT NULL CHECK (lobby_type IN ('solo', 'trio')),
-                    players TEXT DEFAULT '',
-                    teams TEXT DEFAULT '',
-                    max_players INTEGER DEFAULT 6,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Table pour cooldowns séparés - MIGRATION IMPORTANTE
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS lobby_cooldown (
-                    id INTEGER PRIMARY KEY,
-                    lobby_type TEXT NOT NULL CHECK (lobby_type IN ('solo', 'trio')),
-                    last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
@@ -234,111 +311,46 @@ def init_db():
                 )
             ''')
             
-            # MIGRATION CRITIQUE : Vérifier et migrer lobby_cooldown
-            print("🔄 Vérification structure lobby_cooldown...")
-            c.execute("""
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'lobby_cooldown' AND column_name = 'lobby_type'
-            """)
-            lobby_type_exists = c.fetchone()
+            print("  ✅ Toutes les tables dual créées")
             
-            if not lobby_type_exists:
-                print("🔧 Migration lobby_cooldown vers système dual...")
-                # Supprimer ancienne table et recréer
-                c.execute('DROP TABLE IF EXISTS lobby_cooldown CASCADE')
-                c.execute('''
-                    CREATE TABLE lobby_cooldown (
-                        id INTEGER PRIMARY KEY,
-                        lobby_type TEXT NOT NULL CHECK (lobby_type IN ('solo', 'trio')),
-                        last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                # Insérer valeurs par défaut
-                c.execute('''
-                    INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
-                    VALUES (1, 'solo', CURRENT_TIMESTAMP), (2, 'trio', CURRENT_TIMESTAMP)
-                ''')
-                print("✅ lobby_cooldown migré")
-            else:
-                # Insérer cooldowns par défaut si pas présents
-                c.execute('''
-                    INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
-                    VALUES (1, 'solo', CURRENT_TIMESTAMP), (2, 'trio', CURRENT_TIMESTAMP)
-                    ON CONFLICT (id) DO NOTHING
-                ''')
+            # MIGRATION COLONNES DODGES ET MATCH_HISTORY SI NÉCESSAIRES
+            try:
+                c.execute('ALTER TABLE dodges ADD COLUMN dodge_type TEXT DEFAULT \'solo\' CHECK (dodge_type IN (\'solo\', \'trio\'))')
+                print("  ➤ Colonne dodge_type ajoutée")
+            except:
+                pass
             
-            # MIGRATION PRINCIPALE : Vérifier colonnes dual dans players
-            print("🔄 Vérification colonnes ELO dual...")
-            c.execute("""
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'players' AND column_name IN ('solo_elo', 'trio_elo')
-            """)
-            dual_columns = [row['column_name'] for row in c.fetchall()]
+            try:
+                c.execute('ALTER TABLE match_history ADD COLUMN match_type TEXT DEFAULT \'solo\' CHECK (match_type IN (\'solo\', \'trio\'))')
+                print("  ➤ Colonne match_type ajoutée")
+            except:
+                pass
             
-            if 'solo_elo' not in dual_columns:
-                print("🔧 Migration vers système ELO dual...")
-                
-                # Ajouter nouvelles colonnes
-                try:
-                    c.execute('ALTER TABLE players ADD COLUMN solo_elo INTEGER DEFAULT 1000')
-                    print("  ➤ Colonne solo_elo ajoutée")
-                except:
-                    pass
-                
-                try:
-                    c.execute('ALTER TABLE players ADD COLUMN solo_wins INTEGER DEFAULT 0')
-                    print("  ➤ Colonne solo_wins ajoutée")
-                except:
-                    pass
-                
-                try:
-                    c.execute('ALTER TABLE players ADD COLUMN solo_losses INTEGER DEFAULT 0')
-                    print("  ➤ Colonne solo_losses ajoutée")
-                except:
-                    pass
-                
-                try:
-                    c.execute('ALTER TABLE players ADD COLUMN trio_elo INTEGER DEFAULT 1000')
-                    print("  ➤ Colonne trio_elo ajoutée")
-                except:
-                    pass
-                
-                try:
-                    c.execute('ALTER TABLE players ADD COLUMN trio_wins INTEGER DEFAULT 0')
-                    print("  ➤ Colonne trio_wins ajoutée")
-                except:
-                    pass
-                
-                try:
-                    c.execute('ALTER TABLE players ADD COLUMN trio_losses INTEGER DEFAULT 0')
-                    print("  ➤ Colonne trio_losses ajoutée")
-                except:
-                    pass
-                
-                # Migrer données existantes vers solo
-                print("  ➤ Migration données existantes...")
-                c.execute('''
-                    UPDATE players SET 
-                    solo_elo = COALESCE(elo, 1000),
-                    solo_wins = COALESCE(wins, 0),
-                    solo_losses = COALESCE(losses, 0)
-                    WHERE solo_elo IS NULL OR solo_elo = 1000
-                ''')
-                
-                # Vérifier migration
-                c.execute('SELECT COUNT(*) as count FROM players WHERE solo_elo != 1000')
-                migrated = c.fetchone()['count']
-                
-                print(f"✅ Migration ELO dual terminée - {migrated} joueurs migrés")
-            else:
-                print("✅ Colonnes ELO dual déjà présentes")
+            try:
+                c.execute('ALTER TABLE match_messages ADD COLUMN match_type TEXT DEFAULT \'solo\' CHECK (match_type IN (\'solo\', \'trio\'))')
+                print("  ➤ Colonne match_type ajoutée aux messages")
+            except:
+                pass
+            
+            # Mettre à jour les enregistrements NULL
+            c.execute("UPDATE dodges SET dodge_type = 'solo' WHERE dodge_type IS NULL")
+            c.execute("UPDATE match_history SET match_type = 'solo' WHERE match_type IS NULL")
+            c.execute("UPDATE match_messages SET match_type = 'solo' WHERE match_type IS NULL")
             
             conn.commit()
-            logger.info("Base de données dual initialisée avec succès")
+            
+            print("=" * 50)
+            print("✅ MIGRATION COMPLÈTE TERMINÉE")
+            print("🥇 Système Solo opérationnel")
+            print("👥 Système Trio opérationnel")
+            print("🚫 ELO complètement séparés")
+            
+            logger.info("Base de données dual complètement migrée")
             
     except Exception as e:
-        logger.error(f"Erreur initialisation DB: {e}")
-        print(f"❌ Erreur DB: {e}")
+        logger.error(f"Erreur migration DB: {e}")
+        print(f"❌ Erreur migration: {e}")
+        conn.rollback()
     finally:
         conn.close()
 
@@ -662,7 +674,7 @@ async def on_ready():
     print(f'Bot {bot.user} connecté!')
     print(f'Serveurs: {len(bot.guilds)}')
     
-    # Initialiser la base de données dual avec migration
+    # Initialiser la base de données dual avec migration complète
     init_db()
     
     # Initialiser le système de backup
