@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Dual - FICHIER PRINCIPAL
-Configuration avec système Solo + Trio séparés
+Configuration avec système Solo + Trio séparés avec migration automatique
 """
 
 import discord
@@ -58,8 +58,8 @@ LOBBY_COOLDOWN_MINUTES_TRIO = 15
 PING_ROLE_ID = 1396673817769803827
 
 # Paramètres système anti-dodge
-DODGE_PENALTY_BASE = 15  # Pénalité de base pour un dodge
-DODGE_PENALTY_MULTIPLIER = 5  # Multiplicateur par dodge supplémentaire
+DODGE_PENALTY_BASE = 15
+DODGE_PENALTY_MULTIPLIER = 5
 
 # Bot instance
 intents = discord.Intents.default()
@@ -128,7 +128,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 atexit.register(cleanup_and_exit)
 
 # ================================
-# DATABASE POSTGRESQL - VERSION DUAL
+# DATABASE POSTGRESQL - VERSION DUAL AVEC MIGRATION
 # ================================
 
 def get_connection():
@@ -140,7 +140,7 @@ def get_connection():
         return None
 
 def init_db():
-    """Initialise la base de données PostgreSQL avec système dual"""
+    """Initialise la base de données PostgreSQL avec système dual et migration automatique"""
     conn = get_connection()
     if not conn:
         logger.error("Impossible de se connecter à la base de données")
@@ -153,6 +153,9 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS players (
                     discord_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    elo INTEGER DEFAULT 1000,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
                     solo_elo INTEGER DEFAULT 1000,
                     solo_wins INTEGER DEFAULT 0,
                     solo_losses INTEGER DEFAULT 0,
@@ -191,7 +194,7 @@ def init_db():
                 )
             ''')
             
-            # Table pour cooldowns séparés
+            # Table pour cooldowns séparés - MIGRATION IMPORTANTE
             c.execute('''
                 CREATE TABLE IF NOT EXISTS lobby_cooldown (
                     id INTEGER PRIMARY KEY,
@@ -231,43 +234,111 @@ def init_db():
                 )
             ''')
             
-            # Insérer cooldowns par défaut
-            c.execute('''
-                INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
-                VALUES (1, 'solo', CURRENT_TIMESTAMP), (2, 'trio', CURRENT_TIMESTAMP)
-                ON CONFLICT (id) DO NOTHING
-            ''')
+            # MIGRATION CRITIQUE : Vérifier et migrer lobby_cooldown
+            print("🔄 Vérification structure lobby_cooldown...")
+            c.execute("""
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'lobby_cooldown' AND column_name = 'lobby_type'
+            """)
+            lobby_type_exists = c.fetchone()
             
-            # Migrer les anciennes données si nécessaire
+            if not lobby_type_exists:
+                print("🔧 Migration lobby_cooldown vers système dual...")
+                # Supprimer ancienne table et recréer
+                c.execute('DROP TABLE IF EXISTS lobby_cooldown CASCADE')
+                c.execute('''
+                    CREATE TABLE lobby_cooldown (
+                        id INTEGER PRIMARY KEY,
+                        lobby_type TEXT NOT NULL CHECK (lobby_type IN ('solo', 'trio')),
+                        last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                # Insérer valeurs par défaut
+                c.execute('''
+                    INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
+                    VALUES (1, 'solo', CURRENT_TIMESTAMP), (2, 'trio', CURRENT_TIMESTAMP)
+                ''')
+                print("✅ lobby_cooldown migré")
+            else:
+                # Insérer cooldowns par défaut si pas présents
+                c.execute('''
+                    INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
+                    VALUES (1, 'solo', CURRENT_TIMESTAMP), (2, 'trio', CURRENT_TIMESTAMP)
+                    ON CONFLICT (id) DO NOTHING
+                ''')
+            
+            # MIGRATION PRINCIPALE : Vérifier colonnes dual dans players
+            print("🔄 Vérification colonnes ELO dual...")
             c.execute("""
                 SELECT column_name FROM information_schema.columns 
                 WHERE table_name = 'players' AND column_name IN ('solo_elo', 'trio_elo')
             """)
-            new_columns = [row['column_name'] for row in c.fetchall()]
+            dual_columns = [row['column_name'] for row in c.fetchall()]
             
-            if 'solo_elo' not in new_columns:
-                # Migration depuis l'ancien système
-                c.execute('ALTER TABLE players ADD COLUMN solo_elo INTEGER DEFAULT 1000')
-                c.execute('ALTER TABLE players ADD COLUMN solo_wins INTEGER DEFAULT 0') 
-                c.execute('ALTER TABLE players ADD COLUMN solo_losses INTEGER DEFAULT 0')
-                c.execute('ALTER TABLE players ADD COLUMN trio_elo INTEGER DEFAULT 1000')
-                c.execute('ALTER TABLE players ADD COLUMN trio_wins INTEGER DEFAULT 0')
-                c.execute('ALTER TABLE players ADD COLUMN trio_losses INTEGER DEFAULT 0')
+            if 'solo_elo' not in dual_columns:
+                print("🔧 Migration vers système ELO dual...")
+                
+                # Ajouter nouvelles colonnes
+                try:
+                    c.execute('ALTER TABLE players ADD COLUMN solo_elo INTEGER DEFAULT 1000')
+                    print("  ➤ Colonne solo_elo ajoutée")
+                except:
+                    pass
+                
+                try:
+                    c.execute('ALTER TABLE players ADD COLUMN solo_wins INTEGER DEFAULT 0')
+                    print("  ➤ Colonne solo_wins ajoutée")
+                except:
+                    pass
+                
+                try:
+                    c.execute('ALTER TABLE players ADD COLUMN solo_losses INTEGER DEFAULT 0')
+                    print("  ➤ Colonne solo_losses ajoutée")
+                except:
+                    pass
+                
+                try:
+                    c.execute('ALTER TABLE players ADD COLUMN trio_elo INTEGER DEFAULT 1000')
+                    print("  ➤ Colonne trio_elo ajoutée")
+                except:
+                    pass
+                
+                try:
+                    c.execute('ALTER TABLE players ADD COLUMN trio_wins INTEGER DEFAULT 0')
+                    print("  ➤ Colonne trio_wins ajoutée")
+                except:
+                    pass
+                
+                try:
+                    c.execute('ALTER TABLE players ADD COLUMN trio_losses INTEGER DEFAULT 0')
+                    print("  ➤ Colonne trio_losses ajoutée")
+                except:
+                    pass
                 
                 # Migrer données existantes vers solo
+                print("  ➤ Migration données existantes...")
                 c.execute('''
                     UPDATE players SET 
                     solo_elo = COALESCE(elo, 1000),
                     solo_wins = COALESCE(wins, 0),
                     solo_losses = COALESCE(losses, 0)
+                    WHERE solo_elo IS NULL OR solo_elo = 1000
                 ''')
                 
-                print("✅ Migration vers système dual terminée")
+                # Vérifier migration
+                c.execute('SELECT COUNT(*) as count FROM players WHERE solo_elo != 1000')
+                migrated = c.fetchone()['count']
+                
+                print(f"✅ Migration ELO dual terminée - {migrated} joueurs migrés")
+            else:
+                print("✅ Colonnes ELO dual déjà présentes")
             
             conn.commit()
             logger.info("Base de données dual initialisée avec succès")
+            
     except Exception as e:
         logger.error(f"Erreur initialisation DB: {e}")
+        print(f"❌ Erreur DB: {e}")
     finally:
         conn.close()
 
@@ -591,7 +662,7 @@ async def on_ready():
     print(f'Bot {bot.user} connecté!')
     print(f'Serveurs: {len(bot.guilds)}')
     
-    # Initialiser la base de données dual
+    # Initialiser la base de données dual avec migration
     init_db()
     
     # Initialiser le système de backup
@@ -673,72 +744,6 @@ async def main():
     try:
         from commands_dual import setup_commands
         await setup_commands(bot)
-        
-        # Ajouter les commandes backup admin
-        @bot.command(name='backup')
-        async def _backup(ctx):
-            if not ctx.author.guild_permissions.administrator:
-                await ctx.send("Admin uniquement")
-                return
-            
-            if not backup_manager:
-                await ctx.send("Système backup non initialisé")
-                return
-            
-            try:
-                await ctx.send("Backup en cours...")
-                success = backup_manager.create_backup("manual")
-                
-                if success:
-                    await ctx.send("Backup créé avec succès!")
-                else:
-                    await ctx.send("Erreur lors du backup")
-            except Exception as e:
-                print(f"Erreur commande backup: {e}")
-                try:
-                    await ctx.send("Erreur interne")
-                except:
-                    pass
-        
-        @bot.command(name='backupstatus')
-        async def _backupstatus(ctx):
-            if not ctx.author.guild_permissions.administrator:
-                await ctx.send("Admin uniquement")
-                return
-                
-            if not backup_manager:
-                await ctx.send("Système backup non initialisé")
-                return
-            
-            try:
-                backups = backup_manager.list_backups()
-                
-                message = f"SYSTÈME BACKUP\n\n"
-                message += f"Type: Python pur (compatible Koyeb)\n"
-                message += f"Dossier: /tmp/backups\n"
-                message += f"Fréquence: 6 heures\n"
-                message += f"Fichiers: {len(backups)}/{backup_manager.max_backups}\n"
-                
-                if backups:
-                    total_size = sum(b['size_kb'] for b in backups)
-                    message += f"Taille totale: {total_size:.1f} KB\n"
-                    
-                    latest = backups[0]
-                    message += f"\nDernier backup:\n"
-                    message += f"Fichier: {latest['filename']}\n"
-                    message += f"Date: {latest['date'].strftime('%d/%m/%Y %H:%M:%S')}\n"
-                    message += f"Taille: {latest['size_kb']:.1f} KB"
-                else:
-                    message += "\nAucun backup trouvé"
-                
-                await ctx.send(message)
-                
-            except Exception as e:
-                print(f"Erreur backupstatus: {e}")
-                try:
-                    await ctx.send("Erreur lors du statut")
-                except:
-                    pass
         
         print("Bot ELO Dual démarré avec:")
         print("Mode SOLO - Matchmaking individuel")
