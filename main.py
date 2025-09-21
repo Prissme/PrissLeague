@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot ELO Dual - FICHIER PRINCIPAL
-Configuration avec système Solo + Trio séparés avec migration complète
+Bot ELO Dual - FICHIER PRINCIPAL MODIFIÉ
+Configuration avec système Solo + Trio séparés avec modules de commandes séparés
 """
 
 import discord
@@ -152,7 +152,7 @@ def init_db():
             print("=" * 50)
             
             # 1. MIGRATION TABLE PLAYERS
-            print("🔄 1/4 - Migration table players...")
+            print("📄 1/4 - Migration table players...")
             
             # Créer table players avec toutes les colonnes
             c.execute('''
@@ -207,7 +207,7 @@ def init_db():
             print(f"  ✅ {migrated_players} joueurs migrés vers système dual")
             
             # 2. MIGRATION TABLE LOBBIES
-            print("🔄 2/4 - Migration table lobbies...")
+            print("📄 2/4 - Migration table lobbies...")
             
             # Créer table lobbies complète
             c.execute('''
@@ -243,7 +243,7 @@ def init_db():
             print("  ✅ Lobbies existants définis comme solo")
             
             # 3. MIGRATION TABLE LOBBY_COOLDOWN
-            print("🔄 3/4 - Migration table lobby_cooldown...")
+            print("📄 3/4 - Migration table lobby_cooldown...")
             
             # Supprimer et recréer proprement
             c.execute('DROP TABLE IF EXISTS lobby_cooldown CASCADE')
@@ -263,7 +263,7 @@ def init_db():
             print("  ✅ Table lobby_cooldown recréée avec types dual")
             
             # 4. CRÉATION TABLES MANQUANTES
-            print("🔄 4/4 - Création tables système dual...")
+            print("📄 4/4 - Création tables système dual...")
             
             # Table équipes trio
             c.execute('''
@@ -342,7 +342,7 @@ def init_db():
             print("=" * 50)
             print("✅ MIGRATION COMPLÈTE TERMINÉE")
             print("🥇 Système Solo opérationnel")
-            print("👥 Système Trio opérationnel")
+            print("💥 Système Trio opérationnel")
             print("🚫 ELO complètement séparés")
             
             logger.info("Base de données dual complètement migrée")
@@ -736,6 +736,33 @@ async def on_command_error(ctx, error):
         except Exception as e:
             print(f"[UNKNOWN_ERROR] Erreur inattendue envoi message: {e}")
 
+# Commande help globale
+@bot.command(name='help')
+async def help_dual(ctx):
+    message = "🎯 **BOT ELO DUAL - GUIDE**\n\n"
+    
+    message += "🥇 **MODE SOLO**\n"
+    message += "• `!solo <code>` - Créer lobby solo\n"
+    message += "• `!joinsolo <id>` - Rejoindre lobby\n"
+    message += "• `!elosolo` - Voir son ELO solo\n"
+    message += "• `!leaderboardsolo` - Classement solo\n\n"
+    
+    message += "💥 **MODE TRIO**\n"
+    message += "• `!createteam @j1 @j2 Nom` - Créer équipe\n"
+    message += "• `!myteam` - Voir son équipe\n"
+    message += "• `!leaveteam` - Dissoudre équipe (capitaine)\n"
+    message += "• `!teams` - Liste des équipes\n"
+    message += "• `!trio <code>` - Créer lobby trio\n"
+    message += "• `!jointrio <id>` - Rejoindre lobby\n"
+    message += "• `!elotrio` - Voir son ELO trio\n"
+    message += "• `!leaderboardtrio` - Classement trio\n\n"
+    
+    message += "🚫 **IMPORTANT:**\n"
+    message += "• ELO Solo et Trio complètement séparés\n"
+    message += "• Pour le trio, créez d'abord votre équipe fixe"
+    
+    await ctx.send(message)
+
 # ================================
 # FONCTION MAIN
 # ================================
@@ -752,19 +779,22 @@ async def main():
         print("DATABASE_URL manquant!")
         return
     
-    # Importer et configurer les commandes dual
+    # Importer et configurer les commandes séparées
     try:
-        from commands_dual import setup_commands
-        await setup_commands(bot)
+        from commands_solo import setup_solo_commands
+        from commands_trio import setup_trio_commands
         
-        print("Bot ELO Dual démarré avec:")
-        print("Mode SOLO - Matchmaking individuel")
-        print("Mode TRIO - Équipes fixes de 3 joueurs")
-        print("ELO et classements séparés")
-        print("Aucun mélange entre les modes")
+        await setup_solo_commands(bot)
+        await setup_trio_commands(bot)
+        
+        print("Bot ELO Dual démarré avec modules séparés:")
+        print("🥇 Module SOLO - Matchmaking individuel")
+        print("💥 Module TRIO - Équipes fixes de 3 joueurs")
+        print("🚫 ELO et classements complètement séparés")
+        print("📁 Architecture modulaire pour maintenance facilitée")
         
     except ImportError as e:
-        print(f"Erreur import commands_dual.py: {e}")
+        print(f"Erreur import modules de commandes: {e}")
         return
     
     # Lancer le bot avec gestion d'erreurs
