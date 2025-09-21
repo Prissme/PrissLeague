@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot ELO Dual - Version simplifiée
+Bot ELO Solo - Commandes dédiées au mode Solo
 """
 
 import discord
@@ -96,46 +96,15 @@ def add_player_to_solo_lobby(lobby_id, discord_id):
     finally:
         conn.close()
 
-def add_team_to_trio_lobby(lobby_id, team_id):
-    conn = get_connection()
-    if not conn:
-        return False, "Erreur de connexion"
-    
-    try:
-        with conn.cursor() as c:
-            c.execute('SELECT teams, lobby_type FROM lobbies WHERE id = %s', (lobby_id,))
-            result = c.fetchone()
-            if not result or result['lobby_type'] != 'trio':
-                return False, "Lobby trio inexistant"
-            
-            teams = result['teams'].split(',') if result['teams'] else []
-            
-            if str(team_id) in teams:
-                return False, "Équipe déjà dans ce lobby"
-            if len(teams) >= 2:
-                return False, "Lobby complet (2 équipes max)"
-            
-            teams.append(str(team_id))
-            teams_str = ','.join(filter(None, teams))
-            
-            c.execute('UPDATE lobbies SET teams = %s WHERE id = %s', (teams_str, lobby_id))
-            conn.commit()
-            
-            return True, f"Équipe ajoutée! ({len(teams)}/2 équipes)"
-    except:
-        return False, "Erreur interne"
-    finally:
-        conn.close()
-
-class SimpleVoteView(discord.ui.View):
-    def __init__(self, team1_ids, team2_ids, lobby_id, room_code, guild, match_type):
+class SoloVoteView(discord.ui.View):
+    def __init__(self, team1_ids, team2_ids, lobby_id, room_code, guild):
         super().__init__(timeout=None)
         self.team1_ids = team1_ids
         self.team2_ids = team2_ids
         self.lobby_id = lobby_id
         self.room_code = room_code
         self.guild = guild
-        self.match_type = match_type
+        self.match_type = 'solo'
         self.votes = {'team1': set(), 'team2': set()}
         self.dodge_reports = {}
         self.match_validated = False
@@ -152,10 +121,7 @@ class SimpleVoteView(discord.ui.View):
         votes1 = len(self.votes['team1'])
         votes2 = len(self.votes['team2'])
         
-        mode_emoji = "🥇" if self.match_type == 'solo' else "👥"
-        mode_name = "SOLO" if self.match_type == 'solo' else "TRIO"
-        
-        message = f"{mode_emoji} **VOTE RÉSULTAT {mode_name}** - Lobby #{self.lobby_id}\n"
+        message = f"🥇 **VOTE RÉSULTAT SOLO** - Lobby #{self.lobby_id}\n"
         message += f"Code: {self.room_code}\n\n"
         message += f"🔵 **Équipe Bleue** ({votes1} votes):\n{chr(10).join(team1_mentions)}\n\n"
         message += f"🔴 **Équipe Rouge** ({votes2} votes):\n{chr(10).join(team2_mentions)}\n\n"
@@ -268,19 +234,17 @@ class SimpleVoteView(discord.ui.View):
             winners, losers = [], []
             winner_elos, loser_elos = [], []
             
-            elo_field = 'solo_elo' if self.match_type == 'solo' else 'trio_elo'
-            
             for pid in winner_ids:
                 player = get_player(pid)
                 if player:
                     winners.append(player)
-                    winner_elos.append(player[elo_field])
+                    winner_elos.append(player['solo_elo'])
             
             for pid in loser_ids:
                 player = get_player(pid)
                 if player:
                     losers.append(player)
-                    loser_elos.append(player[elo_field])
+                    loser_elos.append(player['solo_elo'])
             
             if len(winners) != 3 or len(losers) != 3:
                 return
@@ -316,8 +280,7 @@ class SimpleVoteView(discord.ui.View):
                 item.disabled = True
             
             team_name = "Bleue" if team1_wins else "Rouge"
-            mode_name = "SOLO" if self.match_type == 'solo' else "TRIO"
-            validation_msg = f"✅ **MATCH {mode_name} VALIDÉ** ({reason})\n🏆 Victoire Équipe {team_name}\nLobby #{self.lobby_id}"
+            validation_msg = f"✅ **MATCH SOLO VALIDÉ** ({reason})\n🏆 Victoire Équipe {team_name}\nLobby #{self.lobby_id}"
             await self._update_message(validation_msg)
             
             class MockMember:
@@ -341,10 +304,8 @@ class SimpleVoteView(discord.ui.View):
                                winner_changes, loser_changes, reason, dodge_player_id=None, dodge_penalty=0):
         try:
             winning_team = "Bleue 🔵" if winners[0]['discord_id'] in [str(i) for i in self.team1_ids] else "Rouge 🔴"
-            mode_emoji = "🥇" if self.match_type == 'solo' else "👥"
-            mode_name = "SOLO" if self.match_type == 'solo' else "TRIO"
             
-            message = f"{mode_emoji} **RÉSULTAT MATCH {mode_name}**\n\n"
+            message = f"🥇 **RÉSULTAT MATCH SOLO**\n\n"
             message += f"**Victoire Équipe {winning_team}** ({reason})\n"
             message += f"Lobby #{self.lobby_id} - Code: {self.room_code}\n\n"
             
@@ -448,8 +409,102 @@ class DodgeSelect(discord.ui.Select):
         except Exception as e:
             print(f"Erreur handle_confirmed_dodge: {e}")
 
-async def setup_commands(bot):
-    # Commandes Solo
+def undo_last_solo_match():
+    """Annule le dernier match solo"""
+    conn = get_connection()
+    if not conn:
+        return False, "Erreur de connexion"
+    
+    try:
+        with conn.cursor() as c:
+            c.execute('''
+                SELECT * FROM match_history 
+                WHERE match_type = 'solo' 
+                ORDER BY match_date DESC 
+                LIMIT 1
+            ''')
+            last_match = c.fetchone()
+            
+            if not last_match:
+                return False, "Aucun match solo à annuler"
+            
+            match_data = json.loads(last_match['match_data'])
+            
+            # Annuler les changements ELO
+            winners = match_data['winners']
+            winner_changes = match_data['winner_elo_changes']
+            
+            for i, player_id in enumerate(winners):
+                old_change = winner_changes[i]
+                c.execute('''
+                    UPDATE players 
+                    SET solo_elo = solo_elo - %s,
+                        solo_wins = GREATEST(solo_wins - 1, 0)
+                    WHERE discord_id = %s
+                ''', (old_change, player_id))
+            
+            losers = match_data['losers']
+            loser_changes = match_data['loser_elo_changes']
+            
+            for i, player_id in enumerate(losers):
+                old_change = loser_changes[i]
+                c.execute('''
+                    UPDATE players 
+                    SET solo_elo = solo_elo - %s,
+                        solo_losses = GREATEST(solo_losses - 1, 0)
+                    WHERE discord_id = %s
+                ''', (old_change, player_id))
+            
+            # Annuler le dodge si il y en avait un
+            dodge_player_id = match_data.get('dodge_player_id')
+            if dodge_player_id:
+                c.execute('''
+                    DELETE FROM dodges 
+                    WHERE id = (
+                        SELECT id FROM dodges 
+                        WHERE discord_id = %s AND dodge_type = 'solo'
+                        ORDER BY dodge_date DESC 
+                        LIMIT 1
+                    )
+                ''', (dodge_player_id,))
+            
+            # Supprimer l'historique
+            c.execute('DELETE FROM match_history WHERE id = %s', (last_match['id'],))
+            
+            conn.commit()
+            
+            # Récupérer les noms pour retour
+            from main import get_player
+            winner_names = []
+            loser_names = []
+            
+            for player_id in winners:
+                player = get_player(player_id)
+                if player:
+                    winner_names.append(player['name'])
+            
+            for player_id in losers:
+                player = get_player(player_id)
+                if player:
+                    loser_names.append(player['name'])
+            
+            return True, {
+                'winners': winner_names,
+                'losers': loser_names,
+                'winner_changes': winner_changes,
+                'loser_changes': loser_changes,
+                'had_dodge': dodge_player_id is not None
+            }
+            
+    except Exception as e:
+        print(f"Erreur undo_last_solo_match: {e}")
+        return False, f"Erreur interne: {str(e)}"
+    finally:
+        conn.close()
+
+async def setup_solo_commands(bot):
+    """Configure toutes les commandes solo"""
+    
     @bot.command(name='solo')
     async def create_solo(ctx, room_code: str = None):
         from main import get_player, create_player, create_lobby, PING_ROLE_ID
@@ -504,11 +559,12 @@ async def setup_commands(bot):
                 
                 vote_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
                 if vote_channel:
-                    vote_view = SimpleVoteView(team1_ids, team2_ids, lobby_id, 
-                                             lobby['room_code'], ctx.guild, 'solo')
+                    vote_view = SoloVoteView(team1_ids, team2_ids, lobby_id, 
+                                           lobby['room_code'], ctx.guild)
                     vote_msg = await vote_channel.send(vote_view._build_message(), view=vote_view)
                     vote_view.current_message = vote_msg
                 
+                # Supprimer le lobby
                 conn = get_connection()
                 if conn:
                     try:
@@ -520,106 +576,6 @@ async def setup_commands(bot):
             else:
                 await ctx.send(f"✅ Rejoint lobby solo! ({len(players)}/6 joueurs)")
     
-    # Commandes Trio
-    @bot.command(name='trio')
-    async def create_trio(ctx, room_code: str = None):
-        from main import get_player, create_player, create_lobby, get_player_trio_team, PING_ROLE_ID
-        
-        if not room_code:
-            await ctx.send("❌ Usage: !trio <code_room>")
-            return
-        
-        team = get_player_trio_team(ctx.author.id)
-        if not team:
-            await ctx.send("❌ Vous devez avoir une équipe trio! Utilisez `!createteam`")
-            return
-        
-        player = get_player(ctx.author.id)
-        if not player:
-            create_player(ctx.author.id, ctx.author.display_name)
-        
-        lobby_id, msg = create_lobby(room_code.upper(), 'trio')
-        if not lobby_id:
-            await ctx.send(f"❌ {msg}")
-            return
-        
-        success, join_msg = add_team_to_trio_lobby(lobby_id, team['id'])
-        if success:
-            message = (f"<@&{PING_ROLE_ID}>\n\n👥 **NOUVEAU LOBBY TRIO #{lobby_id}**\n"
-                      f"Code: {room_code.upper()}\n"
-                      f"Équipe: {team['name']}\n"
-                      f"Rejoindre: !jointrio {lobby_id}")
-            await ctx.send(message)
-        else:
-            await ctx.send(f"❌ {join_msg}")
-    
-    @bot.command(name='jointrio')
-    async def join_trio(ctx, lobby_id: int = None):
-        from main import get_player, create_player, get_lobby, get_player_trio_team
-        
-        if not lobby_id:
-            await ctx.send("❌ Usage: !jointrio <id_lobby>")
-            return
-        
-        team = get_player_trio_team(ctx.author.id)
-        if not team:
-            await ctx.send("❌ Vous devez avoir une équipe trio! Utilisez `!createteam`")
-            return
-        
-        player = get_player(ctx.author.id)
-        if not player:
-            create_player(ctx.author.id, ctx.author.display_name)
-        
-        success, msg = add_team_to_trio_lobby(lobby_id, team['id'])
-        if not success:
-            await ctx.send(f"❌ {msg}")
-            return
-        
-        lobby = get_lobby(lobby_id)
-        if lobby and lobby['lobby_type'] == 'trio':
-            teams = lobby['teams'].split(',') if lobby['teams'] else []
-            if len(teams) >= 2:
-                conn = get_connection()
-                team1_players = []
-                team2_players = []
-                
-                if conn:
-                    try:
-                        with conn.cursor() as c:
-                            c.execute('SELECT * FROM trio_teams WHERE id = %s', (int(teams[0]),))
-                            team1 = c.fetchone()
-                            if team1:
-                                team1_players = [int(team1['captain_id']), int(team1['player2_id']), int(team1['player3_id'])]
-                            
-                            c.execute('SELECT * FROM trio_teams WHERE id = %s', (int(teams[1]),))
-                            team2 = c.fetchone()
-                            if team2:
-                                team2_players = [int(team2['captain_id']), int(team2['player2_id']), int(team2['player3_id'])]
-                    finally:
-                        conn.close()
-                
-                if team1_players and team2_players:
-                    await ctx.send(f"🚀 **MATCH TRIO LANCÉ!** Lobby #{lobby_id}")
-                    
-                    vote_channel = ctx.guild.get_channel(RESULT_CHANNEL_ID)
-                    if vote_channel:
-                        vote_view = SimpleVoteView(team1_players, team2_players, lobby_id, 
-                                                 lobby['room_code'], ctx.guild, 'trio')
-                        vote_msg = await vote_channel.send(vote_view._build_message(), view=vote_view)
-                        vote_view.current_message = vote_msg
-                    
-                    conn = get_connection()
-                    if conn:
-                        try:
-                            with conn.cursor() as c:
-                                c.execute('DELETE FROM lobbies WHERE id = %s', (lobby_id,))
-                                conn.commit()
-                        finally:
-                            conn.close()
-            else:
-                await ctx.send(f"✅ Équipe ajoutée au lobby trio! ({len(teams)}/2 équipes)")
-    
-    # Commandes ELO
     @bot.command(name='elosolo')
     async def elo_solo(ctx, member: discord.Member = None):
         from main import get_player, get_leaderboard
@@ -645,285 +601,50 @@ async def setup_commands(bot):
         
         await ctx.send(message)
     
-    @bot.command(name='elotrio')
-    async def elo_trio(ctx, member: discord.Member = None):
-        from main import get_player, get_leaderboard
+    @bot.command(name='leaderboardsolo')
+    async def leaderboard_solo(ctx):
+        from main import get_leaderboard
         
-        target = member or ctx.author
-        player = get_player(target.id)
-        if not player:
-            await ctx.send("❌ Joueur non inscrit")
+        players = get_leaderboard('solo')[:10]  # Top 10
+        
+        if not players:
+            await ctx.send("❌ Aucun joueur inscrit en solo")
             return
         
-        players = get_leaderboard('trio')
-        rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(target.id)), len(players))
+        message = "🥇 **CLASSEMENT SOLO - TOP 10**\n\n"
         
-        winrate = round(player['trio_wins'] / max(1, player['trio_wins'] + player['trio_losses']) * 100, 1)
-        dodge_count = get_player_dodge_count(target.id, 'trio')
-        
-        message = (f"👥 **{target.display_name} - TRIO**\n"
-                  f"ELO: {player['trio_elo']} | Rang: #{rank}\n"
-                  f"W/L: {player['trio_wins']}/{player['trio_losses']} ({winrate}%)")
-        
-        if dodge_count > 0:
-            message += f"\n🚨 Dodges: {dodge_count}"
+        for i, player in enumerate(players, 1):
+            winrate = round(player['solo_wins'] / max(1, player['solo_wins'] + player['solo_losses']) * 100, 1)
+            
+            if i == 1:
+                emoji = "🥇"
+            elif i == 2:
+                emoji = "🥈"
+            elif i == 3:
+                emoji = "🥉"
+            else:
+                emoji = f"`{i}.`"
+            
+            message += f"{emoji} **{player['name']}** - {player['solo_elo']} ELO\n"
+            message += f"    W/L: {player['solo_wins']}/{player['solo_losses']} ({winrate}%)\n\n"
         
         await ctx.send(message)
     
-    # Commandes Équipe
-    @bot.command(name='createteam')
-    async def create_team(ctx, teammate1: discord.Member, teammate2: discord.Member, *, team_name: str):
-        from main import get_player, create_player, create_trio_team
-        
-        if len(team_name) > 30:
-            await ctx.send("❌ Nom d'équipe trop long (30 caractères max)")
-            return
-        
-        for member in [ctx.author, teammate1, teammate2]:
-            player = get_player(member.id)
-            if not player:
-                create_player(member.id, member.display_name)
-        
-        success, msg = create_trio_team(ctx.author.id, teammate1.id, teammate2.id, team_name)
-        if success:
-            await ctx.send(f"✅ **Équipe Trio créée!**\n"
-                          f"📝 Nom: {team_name}\n"
-                          f"👑 Capitaine: {ctx.author.display_name}\n"
-                          f"👥 Équipiers: {teammate1.display_name}, {teammate2.display_name}")
-        else:
-            await ctx.send(f"❌ {msg}")
-    
-    @bot.command(name='myteam')
-    async def my_team(ctx):
-        from main import get_player_trio_team
-        
-        team = get_player_trio_team(ctx.author.id)
-        if not team:
-            await ctx.send("❌ Vous n'avez pas d'équipe trio. Utilisez `!createteam @joueur1 @joueur2 Nom`")
-            return
-        
-        captain = ctx.guild.get_member(int(team['captain_id']))
-        player2 = ctx.guild.get_member(int(team['player2_id']))
-        player3 = ctx.guild.get_member(int(team['player3_id']))
-        
-        captain_name = captain.display_name if captain else f"ID:{team['captain_id']}"
-        player2_name = player2.display_name if player2 else f"ID:{team['player2_id']}"
-        player3_name = player3.display_name if player3 else f"ID:{team['player3_id']}"
-        
-        message = f"👥 **Équipe: {team['name']}**\n"
-        message += f"👑 Capitaine: {captain_name}\n"
-        message += f"👤 Équipiers: {player2_name}, {player3_name}\n"
-        message += f"📅 Créée: {team['created_at'].strftime('%d/%m/%Y')}"
-        
-        await ctx.send(message)
-    
-    # Commandes Help
-    @bot.command(name='help')
-    async def help_dual(ctx):
-        message = "🎯 **BOT ELO DUAL - GUIDE**\n\n"
-        
-        message += "🥇 **MODE SOLO**\n"
-        message += "• `!solo <code>` - Créer lobby solo\n"
-        message += "• `!joinsolo <id>` - Rejoindre lobby\n"
-        message += "• `!elosolo` - Voir son ELO solo\n\n"
-        
-        message += "👥 **MODE TRIO**\n"
-        message += "• `!createteam @j1 @j2 Nom` - Créer équipe\n"
-        message += "• `!myteam` - Voir son équipe\n"
-        message += "• `!trio <code>` - Créer lobby trio\n"
-        message += "• `!jointrio <id>` - Rejoindre lobby\n"
-        message += "• `!elotrio` - Voir son ELO trio\n\n"
-        
-        message += "🚫 **IMPORTANT:**\n"
-        message += "• ELO Solo et Trio complètement séparés\n"
-        message += "• Pour le trio, créez d'abord votre équipe fixe"
-        
-        await ctx.send(message)
-    
-    # Commandes Admin
     @bot.command(name='undosolo')
     async def undo_solo(ctx):
         if not ctx.author.guild_permissions.administrator:
             await ctx.send("❌ Admin uniquement")
             return
-        success, result = undo_last_match_by_type('solo')
+        
+        success, result = undo_last_solo_match()
         if success:
             message = f"🔄 **MATCH SOLO ANNULÉ!**\n"
             message += f"Gagnants: {', '.join(result['winners'])}\n"
             message += f"Perdants: {', '.join(result['losers'])}"
         else:
             message = f"❌ Erreur: {result}"
+        
         await ctx.send(message)
     
-    @bot.command(name='undotrio')
-    async def undo_trio(ctx):
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Admin uniquement")
-            return
-        success, result = undo_last_match_by_type('trio')
-        if success:
-            message = f"🔄 **MATCH TRIO ANNULÉ!**\n"
-            message += f"Gagnants: {', '.join(result['winners'])}\n"
-            message += f"Perdants: {', '.join(result['losers'])}"
-        else:
-            message = f"❌ Erreur: {result}"
-        await ctx.send(message)
-    
-    # Event handler pour annulation
-    @bot.event
-    async def on_raw_reaction_add(payload):
-        if payload.user_id == bot.user.id:
-            return
-        
-        if str(payload.emoji) != "↩️" or payload.channel_id != MATCH_SUMMARY_CHANNEL_ID:
-            return
-        
-        conn = get_connection()
-        if not conn:
-            return
-        
-        try:
-            with conn.cursor() as c:
-                c.execute('SELECT match_type FROM match_messages WHERE message_id = %s', (payload.message_id,))
-                result = c.fetchone()
-                if not result:
-                    return
-                
-                match_type = result['match_type']
-        finally:
-            conn.close()
-        
-        guild = payload.member.guild if payload.member else None
-        if not guild:
-            return
-        
-        member = guild.get_member(payload.user_id)
-        if not member or not member.guild_permissions.administrator:
-            return
-        
-        success, result = undo_last_match_by_type(match_type)
-        if success:
-            channel = guild.get_channel(payload.channel_id)
-            if channel:
-                try:
-                    message = await channel.fetch_message(payload.message_id)
-                    mode_name = "SOLO" if match_type == 'solo' else "TRIO"
-                    cancel_msg = f"❌ **MATCH {mode_name} ANNULÉ** par {member.display_name}\n\n"
-                    cancel_msg += f"🔄 Gagnants: {', '.join(result['winners'])}\n"
-                    cancel_msg += f"🔄 Perdants: {', '.join(result['losers'])}"
-                    
-                    await message.edit(content=cancel_msg)
-                    await message.clear_reactions()
-                    
-                    conn = get_connection()
-                    if conn:
-                        try:
-                            with conn.cursor() as c:
-                                c.execute('DELETE FROM match_messages WHERE message_id = %s', (payload.message_id,))
-                                conn.commit()
-                        finally:
-                            conn.close()
-                except:
-                    pass
-    
-    print("✅ Bot ELO Dual simplifié configuré")
+    print("✅ Commandes SOLO configurées")
     print("🥇 Mode SOLO - Matchmaking individuel")
-    print("👥 Mode TRIO - Équipes fixes de 3 joueurs")
-    print("🚫 ELO et classements complètement séparés")
-
-def undo_last_match_by_type(match_type):
-    conn = get_connection()
-    if not conn:
-        return False, "Erreur de connexion"
-    
-    try:
-        with conn.cursor() as c:
-            c.execute('''
-                SELECT * FROM match_history 
-                WHERE match_type = %s 
-                ORDER BY match_date DESC 
-                LIMIT 1
-            ''', (match_type,))
-            last_match = c.fetchone()
-            
-            if not last_match:
-                return False, f"Aucun match {match_type} à annuler"
-            
-            match_data = json.loads(last_match['match_data'])
-            
-            if match_type == 'solo':
-                elo_field = 'solo_elo'
-                wins_field = 'solo_wins'
-                losses_field = 'solo_losses'
-            else:
-                elo_field = 'trio_elo'
-                wins_field = 'trio_wins'
-                losses_field = 'trio_losses'
-            
-            winners = match_data['winners']
-            winner_changes = match_data['winner_elo_changes']
-            
-            for i, player_id in enumerate(winners):
-                old_change = winner_changes[i]
-                c.execute(f'''
-                    UPDATE players 
-                    SET {elo_field} = {elo_field} - %s,
-                        {wins_field} = GREATEST({wins_field} - 1, 0)
-                    WHERE discord_id = %s
-                ''', (old_change, player_id))
-            
-            losers = match_data['losers']
-            loser_changes = match_data['loser_elo_changes']
-            
-            for i, player_id in enumerate(losers):
-                old_change = loser_changes[i]
-                c.execute(f'''
-                    UPDATE players 
-                    SET {elo_field} = {elo_field} - %s,
-                        {losses_field} = GREATEST({losses_field} - 1, 0)
-                    WHERE discord_id = %s
-                ''', (old_change, player_id))
-            
-            dodge_player_id = match_data.get('dodge_player_id')
-            if dodge_player_id:
-                c.execute('''
-                    DELETE FROM dodges 
-                    WHERE id = (
-                        SELECT id FROM dodges 
-                        WHERE discord_id = %s AND dodge_type = %s
-                        ORDER BY dodge_date DESC 
-                        LIMIT 1
-                    )
-                ''', (dodge_player_id, match_type))
-            
-            c.execute('DELETE FROM match_history WHERE id = %s', (last_match['id'],))
-            
-            conn.commit()
-            
-            from main import get_player
-            winner_names = []
-            loser_names = []
-            
-            for player_id in winners:
-                player = get_player(player_id)
-                if player:
-                    winner_names.append(player['name'])
-            
-            for player_id in losers:
-                player = get_player(player_id)
-                if player:
-                    loser_names.append(player['name'])
-            
-            return True, {
-                'winners': winner_names,
-                'losers': loser_names,
-                'winner_changes': winner_changes,
-                'loser_changes': loser_changes,
-                'had_dodge': dodge_player_id is not None
-            }
-            
-    except Exception as e:
-        print(f"Erreur undo_last_match_by_type: {e}")
-        return False, f"Erreur interne: {str(e)}"
-    finally:
-        conn.close()
