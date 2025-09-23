@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Bot ELO Chaos - Mode de jeu chaotique et fun
-Map aléatoire + Brawler aléatoire + Modificateur aléatoire
+Version corrigée avec gestion robuste des erreurs de base de données
 """
 
 import discord
@@ -94,6 +94,57 @@ def get_connection():
     from main import get_connection as main_get_connection
     return main_get_connection()
 
+def ensure_chaos_database():
+    """S'assure que la base de données est prête pour le chaos"""
+    conn = get_connection()
+    if not conn:
+        return False
+    
+    try:
+        with conn.cursor() as c:
+            # Vérifier/créer colonnes chaos
+            chaos_columns = [
+                ('chaos_elo', 'INTEGER DEFAULT 1000'),
+                ('chaos_wins', 'INTEGER DEFAULT 0'),
+                ('chaos_losses', 'INTEGER DEFAULT 0')
+            ]
+            
+            for col_name, col_def in chaos_columns:
+                try:
+                    # Test si la colonne existe
+                    c.execute(f"SELECT {col_name} FROM players LIMIT 1")
+                except Exception:
+                    # Colonne manquante, l'ajouter
+                    try:
+                        c.execute(f'ALTER TABLE players ADD COLUMN {col_name} {col_def}')
+                        conn.commit()
+                        print(f"Colonne {col_name} ajoutée automatiquement")
+                    except Exception as e:
+                        print(f"Impossible d'ajouter {col_name}: {e}")
+                        conn.rollback()
+            
+            # Vérifier/créer entrée cooldown chaos
+            try:
+                c.execute("SELECT COUNT(*) as count FROM lobby_cooldown WHERE lobby_type = 'chaos'")
+                if c.fetchone()['count'] == 0:
+                    c.execute("""
+                        INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
+                        VALUES (3, 'chaos', CURRENT_TIMESTAMP)
+                        ON CONFLICT (id) DO UPDATE SET lobby_type = 'chaos'
+                    """)
+                    conn.commit()
+                    print("Entrée cooldown chaos créée automatiquement")
+            except Exception as e:
+                print(f"Erreur cooldown chaos: {e}")
+                conn.rollback()
+            
+            return True
+    except Exception as e:
+        print(f"Erreur ensure_chaos_database: {e}")
+        return False
+    finally:
+        conn.close()
+
 def save_match_message_id(message_id, match_type):
     conn = get_connection()
     if not conn:
@@ -104,7 +155,9 @@ def save_match_message_id(message_id, match_type):
                      (message_id, match_type))
             conn.commit()
         return True
-    except:
+    except Exception as e:
+        print(f"Erreur save_match_message_id: {e}")
+        conn.rollback()
         return False
     finally:
         conn.close()
@@ -119,7 +172,8 @@ def get_player_dodge_count(discord_id, match_type):
                      (str(discord_id), match_type))
             result = c.fetchone()
             return result['count'] if result else 0
-    except:
+    except Exception as e:
+        print(f"Erreur get_player_dodge_count: {e}")
         return 0
     finally:
         conn.close()
@@ -134,7 +188,9 @@ def record_dodge(discord_id, match_type):
                      (str(discord_id), match_type))
             conn.commit()
         return True
-    except:
+    except Exception as e:
+        print(f"Erreur record_dodge: {e}")
+        conn.rollback()
         return False
     finally:
         conn.close()
@@ -165,7 +221,9 @@ def add_player_to_chaos_lobby(lobby_id, discord_id):
             conn.commit()
             
             return True, f"Rejoint! ({len(players)}/6 joueurs)"
-    except:
+    except Exception as e:
+        print(f"Erreur add_player_to_chaos_lobby: {e}")
+        conn.rollback()
         return False, "Erreur interne"
     finally:
         conn.close()
@@ -320,7 +378,7 @@ class ChaosVoteView(discord.ui.View):
     
     async def validate_match(self, team1_wins, reason, dodge_player_id=None, dodge_penalty=0):
         try:
-            from main import get_player, update_player_elo, calculate_elo_change, save_match_history
+            from main import get_player, calculate_elo_change, save_match_history
             
             self.match_validated = True
             
@@ -330,22 +388,23 @@ class ChaosVoteView(discord.ui.View):
             winners, losers = [], []
             winner_elos, loser_elos = [], []
             
-            # Utiliser chaos_elo au lieu de solo_elo/trio_elo
+            # Utiliser chaos_elo avec gestion sécurisée
             for pid in winner_ids:
                 player = get_player(pid)
                 if player:
                     winners.append(player)
-                    chaos_elo = player.get('chaos_elo', 1000)  # Default à 1000 si pas encore défini
+                    chaos_elo = player.get('chaos_elo', 1000) or 1000
                     winner_elos.append(chaos_elo)
             
             for pid in loser_ids:
                 player = get_player(pid)
                 if player:
                     losers.append(player)
-                    chaos_elo = player.get('chaos_elo', 1000)
+                    chaos_elo = player.get('chaos_elo', 1000) or 1000
                     loser_elos.append(chaos_elo)
             
             if len(winners) != 3 or len(losers) != 3:
+                await self.safe_respond(None, "Erreur validation: joueurs manquants")
                 return
             
             winner_avg = sum(winner_elos) / 3
@@ -360,7 +419,7 @@ class ChaosVoteView(discord.ui.View):
                 if dodge_player_id:
                     change = int(change * 0.8)
                 new_elo = max(0, old_elo + change)
-                update_chaos_player_elo(player['discord_id'], new_elo, True)
+                update_chaos_player_elo_safe(player['discord_id'], new_elo, True)
                 winner_changes.append(change)
             
             for i, player in enumerate(losers):
@@ -373,7 +432,7 @@ class ChaosVoteView(discord.ui.View):
                     change = int(change * 0.3)
                 
                 new_elo = max(0, old_elo + change)
-                update_chaos_player_elo(player['discord_id'], new_elo, False)
+                update_chaos_player_elo_safe(player['discord_id'], new_elo, False)
                 loser_changes.append(change)
             
             for item in self.children:
@@ -512,28 +571,38 @@ class ChaosDodgeSelect(discord.ui.Select):
         except Exception as e:
             print(f"Erreur handle_confirmed_dodge chaos: {e}")
 
-def update_chaos_player_elo(discord_id, new_elo, won):
-    """Met à jour l'ELO chaos d'un joueur avec win/loss"""
+def update_chaos_player_elo_safe(discord_id, new_elo, won):
+    """Version sécurisée de l'update ELO chaos avec gestion robuste des erreurs"""
     conn = get_connection()
     if not conn:
+        print(f"Erreur update_chaos_player_elo_safe: Impossible de se connecter")
         return False
     
     try:
         with conn.cursor() as c:
-            # S'assurer que les colonnes chaos existent
+            # Vérifier que les colonnes chaos existent
             try:
-                c.execute('ALTER TABLE players ADD COLUMN chaos_elo INTEGER DEFAULT 1000')
-            except:
-                pass
-            try:
-                c.execute('ALTER TABLE players ADD COLUMN chaos_wins INTEGER DEFAULT 0')
-            except:
-                pass
-            try:
-                c.execute('ALTER TABLE players ADD COLUMN chaos_losses INTEGER DEFAULT 0')
-            except:
-                pass
+                c.execute("SELECT chaos_elo, chaos_wins, chaos_losses FROM players LIMIT 1")
+            except Exception:
+                # Colonnes manquantes, essayer de les créer
+                print("Tentative de création automatique des colonnes chaos...")
+                chaos_columns = [
+                    ('chaos_elo', 'INTEGER DEFAULT 1000'),
+                    ('chaos_wins', 'INTEGER DEFAULT 0'),
+                    ('chaos_losses', 'INTEGER DEFAULT 0')
+                ]
+                
+                for col_name, col_def in chaos_columns:
+                    try:
+                        c.execute(f'ALTER TABLE players ADD COLUMN {col_name} {col_def}')
+                        conn.commit()
+                        print(f"Colonne {col_name} créée")
+                    except Exception as e:
+                        print(f"Impossible de créer {col_name}: {e}")
+                        conn.rollback()
+                        return False
             
+            # Effectuer la mise à jour
             if won:
                 c.execute('''
                     UPDATE players 
@@ -546,32 +615,54 @@ def update_chaos_player_elo(discord_id, new_elo, won):
                     SET chaos_elo = %s, chaos_losses = COALESCE(chaos_losses, 0) + 1 
                     WHERE discord_id = %s
                 ''', (new_elo, str(discord_id)))
+            
+            # Vérifier que la mise à jour a réussi
+            if c.rowcount == 0:
+                print(f"Aucun joueur trouvé pour l'ID {discord_id}")
+                return False
+            
             conn.commit()
             return True
+            
     except Exception as e:
-        print(f"Erreur update_chaos_player_elo: {e}")
+        print(f"Erreur update_chaos_player_elo_safe: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
         return False
     finally:
         conn.close()
 
 def get_chaos_leaderboard():
-    """Récupère le classement chaos"""
+    """Récupère le classement chaos avec gestion robuste des erreurs"""
     conn = get_connection()
     if not conn:
         return []
     
     try:
         with conn.cursor() as c:
-            c.execute('''
-                SELECT *, COALESCE(chaos_elo, 1000) as chaos_elo,
-                       COALESCE(chaos_wins, 0) as chaos_wins,
-                       COALESCE(chaos_losses, 0) as chaos_losses
-                FROM players 
-                ORDER BY COALESCE(chaos_elo, 1000) DESC 
-                LIMIT 20
-            ''')
-            results = c.fetchall()
-            return [dict(row) for row in results] if results else []
+            # Vérifier que les colonnes chaos existent
+            try:
+                c.execute('''
+                    SELECT *, 
+                           COALESCE(chaos_elo, 1000) as chaos_elo,
+                           COALESCE(chaos_wins, 0) as chaos_wins,
+                           COALESCE(chaos_losses, 0) as chaos_losses
+                    FROM players 
+                    ORDER BY COALESCE(chaos_elo, 1000) DESC 
+                    LIMIT 20
+                ''')
+                results = c.fetchall()
+                return [dict(row) for row in results] if results else []
+            except Exception as e:
+                if "does not exist" in str(e).lower():
+                    print("Colonnes chaos manquantes dans get_chaos_leaderboard")
+                    # S'assurer que la base est configurée
+                    ensure_chaos_database()
+                    return []
+                else:
+                    raise e
     except Exception as e:
         print(f"Erreur get_chaos_leaderboard: {e}")
         return []
@@ -579,7 +670,7 @@ def get_chaos_leaderboard():
         conn.close()
 
 def undo_last_chaos_match():
-    """Annule le dernier match chaos"""
+    """Annule le dernier match chaos avec gestion robuste"""
     conn = get_connection()
     if not conn:
         return False, "Erreur de connexion"
@@ -599,43 +690,52 @@ def undo_last_chaos_match():
             
             match_data = json.loads(last_match['match_data'])
             
-            # Annuler les changements ELO
+            # Annuler les changements ELO avec gestion sécurisée
             winners = match_data['winners']
             winner_changes = match_data['winner_elo_changes']
             
             for i, player_id in enumerate(winners):
                 old_change = winner_changes[i]
-                c.execute('''
-                    UPDATE players 
-                    SET chaos_elo = COALESCE(chaos_elo, 1000) - %s,
-                        chaos_wins = GREATEST(COALESCE(chaos_wins, 0) - 1, 0)
-                    WHERE discord_id = %s
-                ''', (old_change, player_id))
+                try:
+                    c.execute('''
+                        UPDATE players 
+                        SET chaos_elo = COALESCE(chaos_elo, 1000) - %s,
+                            chaos_wins = GREATEST(COALESCE(chaos_wins, 0) - 1, 0)
+                        WHERE discord_id = %s
+                    ''', (old_change, player_id))
+                except Exception as e:
+                    print(f"Erreur annulation winner {player_id}: {e}")
             
             losers = match_data['losers']
             loser_changes = match_data['loser_elo_changes']
             
             for i, player_id in enumerate(losers):
                 old_change = loser_changes[i]
-                c.execute('''
-                    UPDATE players 
-                    SET chaos_elo = COALESCE(chaos_elo, 1000) - %s,
-                        chaos_losses = GREATEST(COALESCE(chaos_losses, 0) - 1, 0)
-                    WHERE discord_id = %s
-                ''', (old_change, player_id))
+                try:
+                    c.execute('''
+                        UPDATE players 
+                        SET chaos_elo = COALESCE(chaos_elo, 1000) - %s,
+                            chaos_losses = GREATEST(COALESCE(chaos_losses, 0) - 1, 0)
+                        WHERE discord_id = %s
+                    ''', (old_change, player_id))
+                except Exception as e:
+                    print(f"Erreur annulation loser {player_id}: {e}")
             
             # Annuler le dodge si il y en avait un
             dodge_player_id = match_data.get('dodge_player_id')
             if dodge_player_id:
-                c.execute('''
-                    DELETE FROM dodges 
-                    WHERE id = (
-                        SELECT id FROM dodges 
-                        WHERE discord_id = %s AND dodge_type = 'chaos'
-                        ORDER BY dodge_date DESC 
-                        LIMIT 1
-                    )
-                ''', (dodge_player_id,))
+                try:
+                    c.execute('''
+                        DELETE FROM dodges 
+                        WHERE id = (
+                            SELECT id FROM dodges 
+                            WHERE discord_id = %s AND dodge_type = 'chaos'
+                            ORDER BY dodge_date DESC 
+                            LIMIT 1
+                        )
+                    ''', (dodge_player_id,))
+                except Exception as e:
+                    print(f"Erreur annulation dodge: {e}")
             
             # Supprimer l'historique
             c.execute('DELETE FROM match_history WHERE id = %s', (last_match['id'],))
@@ -667,12 +767,20 @@ def undo_last_chaos_match():
             
     except Exception as e:
         print(f"Erreur undo_last_chaos_match: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
         return False, f"Erreur interne: {str(e)}"
     finally:
         conn.close()
 
 async def setup_chaos_commands(bot):
-    """Configure toutes les commandes chaos"""
+    """Configure toutes les commandes chaos avec vérification préalable"""
+    
+    # S'assurer que la base de données est prête
+    if not ensure_chaos_database():
+        print("⚠️ Problème configuration base de données chaos")
     
     @bot.command(name='chaos')
     async def create_chaos(ctx, room_code: str = None):
@@ -685,6 +793,11 @@ async def setup_chaos_commands(bot):
         player = get_player(ctx.author.id)
         if not player:
             create_player(ctx.author.id, ctx.author.display_name)
+        
+        # S'assurer que la base supporte chaos avant de créer le lobby
+        if not ensure_chaos_database():
+            await ctx.send("❌ Système chaos temporairement indisponible")
+            return
         
         lobby_id, msg = create_lobby(room_code.upper(), 'chaos')
         if not lobby_id:
@@ -767,11 +880,11 @@ async def setup_chaos_commands(bot):
             return
         
         players = get_chaos_leaderboard()
-        rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(target.id)), len(players))
+        rank = next((i for i, p in enumerate(players, 1) if p['discord_id'] == str(target.id)), len(players) + 1)
         
-        chaos_elo = player.get('chaos_elo', 1000)
-        chaos_wins = player.get('chaos_wins', 0)
-        chaos_losses = player.get('chaos_losses', 0)
+        chaos_elo = player.get('chaos_elo', 1000) or 1000
+        chaos_wins = player.get('chaos_wins', 0) or 0
+        chaos_losses = player.get('chaos_losses', 0) or 0
         
         winrate = round(chaos_wins / max(1, chaos_wins + chaos_losses) * 100, 1)
         dodge_count = get_player_dodge_count(target.id, 'chaos')
@@ -796,8 +909,8 @@ async def setup_chaos_commands(bot):
         message = "🎲 **CLASSEMENT CHAOS - TOP 10**\n\n"
         
         for i, player in enumerate(players, 1):
-            chaos_wins = player.get('chaos_wins', 0)
-            chaos_losses = player.get('chaos_losses', 0)
+            chaos_wins = player.get('chaos_wins', 0) or 0
+            chaos_losses = player.get('chaos_losses', 0) or 0
             winrate = round(chaos_wins / max(1, chaos_wins + chaos_losses) * 100, 1)
             
             if i == 1:
@@ -809,7 +922,8 @@ async def setup_chaos_commands(bot):
             else:
                 emoji = f"`{i}.`"
             
-            message += f"{emoji} **{player['name']}** - {player.get('chaos_elo', 1000)} ELO\n"
+            chaos_elo = player.get('chaos_elo', 1000) or 1000
+            message += f"{emoji} **{player['name']}** - {chaos_elo} ELO\n"
             message += f"    W/L: {chaos_wins}/{chaos_losses} ({winrate}%)\n\n"
         
         await ctx.send(message)
@@ -870,7 +984,21 @@ async def setup_chaos_commands(bot):
         
         await ctx.send(message)
     
-    print("✅ Commandes CHAOS configurées")
+    @bot.command(name='chaostest')
+    async def chaos_test(ctx):
+        """Test les fonctionnalités chaos (admin seulement)"""
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Admin uniquement")
+            return
+        
+        success = ensure_chaos_database()
+        if success:
+            await ctx.send("✅ Base de données chaos opérationnelle")
+        else:
+            await ctx.send("❌ Problème avec la base de données chaos")
+    
+    print("✅ Commandes CHAOS configurées avec gestion robuste")
     print("🎲 Mode CHAOS - Expérience aléatoire et fun")
     print("🗺️ Maps, brawlers et modificateurs au hasard")
     print("⚡ ELO complètement séparé des autres modes")
+    print("🛡️ Protection contre les erreurs de base de données")
