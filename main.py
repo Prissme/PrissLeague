@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot ELO Dual - FICHIER PRINCIPAL MODIFIÉ
-Configuration avec système Solo + Trio séparés avec modules de commandes séparés
+Bot ELO Triple - FICHIER PRINCIPAL MODIFIÉ
+Configuration avec système Solo + Trio + Chaos séparés avec modules de commandes séparés
 """
 
 import discord
@@ -53,8 +53,10 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 # Paramètres des lobbies
 MAX_CONCURRENT_LOBBIES_SOLO = 3
 MAX_CONCURRENT_LOBBIES_TRIO = 2
+MAX_CONCURRENT_LOBBIES_CHAOS = 3  # Nouveau
 LOBBY_COOLDOWN_MINUTES_SOLO = 10
 LOBBY_COOLDOWN_MINUTES_TRIO = 15
+LOBBY_COOLDOWN_MINUTES_CHAOS = 5  # Plus court pour le fun
 PING_ROLE_ID = 1396673817769803827
 
 # Paramètres système anti-dodge
@@ -108,7 +110,7 @@ def calculate_dodge_penalty(dodge_count):
 
 def signal_handler(sig, frame):
     """Gestionnaire pour arrêt propre du bot"""
-    print(f"\n🛑 Signal {sig} reçu, arrêt en cours...")
+    print(f"\nðŸ›' Signal {sig} reçu, arrêt en cours...")
     cleanup_and_exit()
 
 def cleanup_and_exit():
@@ -128,7 +130,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 atexit.register(cleanup_and_exit)
 
 # ================================
-# DATABASE POSTGRESQL - MIGRATION COMPLÈTE
+# DATABASE POSTGRESQL - MIGRATION COMPLÈTE TRIPLE
 # ================================
 
 def get_connection():
@@ -140,7 +142,7 @@ def get_connection():
         return None
 
 def init_db():
-    """Initialise et migre complètement la base vers le système dual"""
+    """Initialise et migre complètement la base vers le système triple"""
     conn = get_connection()
     if not conn:
         logger.error("Impossible de se connecter à la base de données")
@@ -148,13 +150,13 @@ def init_db():
     
     try:
         with conn.cursor() as c:
-            print("🔧 MIGRATION COMPLÈTE VERS SYSTÈME DUAL")
+            print("🔧 MIGRATION COMPLÈTE VERS SYSTÈME TRIPLE")
             print("=" * 50)
             
-            # 1. MIGRATION TABLE PLAYERS
-            print("📄 1/4 - Migration table players...")
+            # 1. MIGRATION TABLE PLAYERS AVEC CHAOS
+            print("📄 1/4 - Migration table players avec mode Chaos...")
             
-            # Créer table players avec toutes les colonnes
+            # Créer table players avec toutes les colonnes incluant chaos
             c.execute('''
                 CREATE TABLE IF NOT EXISTS players (
                     discord_id TEXT PRIMARY KEY,
@@ -168,21 +170,27 @@ def init_db():
                     trio_elo INTEGER DEFAULT 1000,
                     trio_wins INTEGER DEFAULT 0,
                     trio_losses INTEGER DEFAULT 0,
+                    chaos_elo INTEGER DEFAULT 1000,
+                    chaos_wins INTEGER DEFAULT 0,
+                    chaos_losses INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Ajouter colonnes dual si manquantes
-            dual_columns = {
+            # Ajouter colonnes triple si manquantes
+            triple_columns = {
                 'solo_elo': 'INTEGER DEFAULT 1000',
                 'solo_wins': 'INTEGER DEFAULT 0',
                 'solo_losses': 'INTEGER DEFAULT 0',
                 'trio_elo': 'INTEGER DEFAULT 1000',
                 'trio_wins': 'INTEGER DEFAULT 0',
-                'trio_losses': 'INTEGER DEFAULT 0'
+                'trio_losses': 'INTEGER DEFAULT 0',
+                'chaos_elo': 'INTEGER DEFAULT 1000',
+                'chaos_wins': 'INTEGER DEFAULT 0',
+                'chaos_losses': 'INTEGER DEFAULT 0'
             }
             
-            for col_name, col_type in dual_columns.items():
+            for col_name, col_type in triple_columns.items():
                 try:
                     c.execute(f'ALTER TABLE players ADD COLUMN {col_name} {col_type}')
                     print(f"  ➤ Ajouté colonne {col_name}")
@@ -204,17 +212,17 @@ def init_db():
             
             c.execute('SELECT COUNT(*) as count FROM players WHERE solo_elo != 1000')
             migrated_players = c.fetchone()['count']
-            print(f"  ✅ {migrated_players} joueurs migrés vers système dual")
+            print(f"  ✅ {migrated_players} joueurs migrés vers système triple")
             
-            # 2. MIGRATION TABLE LOBBIES
-            print("📄 2/4 - Migration table lobbies...")
+            # 2. MIGRATION TABLE LOBBIES AVEC CHAOS
+            print("📄 2/4 - Migration table lobbies avec mode Chaos...")
             
             # Créer table lobbies complète
             c.execute('''
                 CREATE TABLE IF NOT EXISTS lobbies (
                     id SERIAL PRIMARY KEY,
                     room_code TEXT NOT NULL,
-                    lobby_type TEXT DEFAULT 'solo' CHECK (lobby_type IN ('solo', 'trio')),
+                    lobby_type TEXT DEFAULT 'solo' CHECK (lobby_type IN ('solo', 'trio', 'chaos')),
                     players TEXT DEFAULT '',
                     teams TEXT DEFAULT '',
                     max_players INTEGER DEFAULT 6,
@@ -224,7 +232,7 @@ def init_db():
             
             # Ajouter colonnes manquantes
             lobby_columns = {
-                'lobby_type': "TEXT DEFAULT 'solo' CHECK (lobby_type IN ('solo', 'trio'))",
+                'lobby_type': "TEXT DEFAULT 'solo'",
                 'teams': "TEXT DEFAULT ''"
             }
             
@@ -238,32 +246,42 @@ def init_db():
                     if "already exists" not in str(e):
                         print(f"  ⚠️ Erreur colonne {col_name}: {e}")
             
+            # Mettre à jour la contrainte pour inclure chaos
+            try:
+                c.execute('ALTER TABLE lobbies DROP CONSTRAINT IF EXISTS lobbies_lobby_type_check')
+                c.execute("ALTER TABLE lobbies ADD CONSTRAINT lobbies_lobby_type_check CHECK (lobby_type IN ('solo', 'trio', 'chaos'))")
+                print("  ✅ Contrainte lobby_type mise à jour pour inclure chaos")
+            except Exception as e:
+                print(f"  ⚠️ Erreur contrainte: {e}")
+            
             # Définir lobbies existants comme solo
             c.execute("UPDATE lobbies SET lobby_type = 'solo' WHERE lobby_type IS NULL")
             print("  ✅ Lobbies existants définis comme solo")
             
-            # 3. MIGRATION TABLE LOBBY_COOLDOWN
-            print("📄 3/4 - Migration table lobby_cooldown...")
+            # 3. MIGRATION TABLE LOBBY_COOLDOWN AVEC CHAOS
+            print("📄 3/4 - Migration table lobby_cooldown avec mode Chaos...")
             
             # Supprimer et recréer proprement
             c.execute('DROP TABLE IF EXISTS lobby_cooldown CASCADE')
             c.execute('''
                 CREATE TABLE lobby_cooldown (
                     id INTEGER PRIMARY KEY,
-                    lobby_type TEXT NOT NULL CHECK (lobby_type IN ('solo', 'trio')),
+                    lobby_type TEXT NOT NULL CHECK (lobby_type IN ('solo', 'trio', 'chaos')),
                     last_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Insérer valeurs par défaut
+            # Insérer valeurs par défaut pour les 3 modes
             c.execute('''
                 INSERT INTO lobby_cooldown (id, lobby_type, last_creation) 
-                VALUES (1, 'solo', CURRENT_TIMESTAMP), (2, 'trio', CURRENT_TIMESTAMP)
+                VALUES (1, 'solo', CURRENT_TIMESTAMP), 
+                       (2, 'trio', CURRENT_TIMESTAMP),
+                       (3, 'chaos', CURRENT_TIMESTAMP)
             ''')
-            print("  ✅ Table lobby_cooldown recréée avec types dual")
+            print("  ✅ Table lobby_cooldown recréée avec types triple")
             
             # 4. CRÉATION TABLES MANQUANTES
-            print("📄 4/4 - Création tables système dual...")
+            print("📄 4/4 - Création tables système triple...")
             
             # Table équipes trio
             c.execute('''
@@ -280,55 +298,58 @@ def init_db():
                 )
             ''')
             
-            # Table dodges avec type
+            # Table dodges avec type (incluant chaos)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS dodges (
                     id SERIAL PRIMARY KEY,
                     discord_id TEXT NOT NULL,
-                    dodge_type TEXT NOT NULL CHECK (dodge_type IN ('solo', 'trio')),
+                    dodge_type TEXT NOT NULL CHECK (dodge_type IN ('solo', 'trio', 'chaos')),
                     dodge_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (discord_id) REFERENCES players(discord_id)
                 )
             ''')
             
-            # Table historique avec type
+            # Table historique avec type (incluant chaos)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS match_history (
                     id SERIAL PRIMARY KEY,
-                    match_type TEXT NOT NULL CHECK (match_type IN ('solo', 'trio')),
+                    match_type TEXT NOT NULL CHECK (match_type IN ('solo', 'trio', 'chaos')),
                     match_data TEXT NOT NULL,
                     match_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            # Table messages match avec type
+            # Table messages match avec type (incluant chaos)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS match_messages (
                     message_id BIGINT PRIMARY KEY,
-                    match_type TEXT NOT NULL CHECK (match_type IN ('solo', 'trio')),
+                    match_type TEXT NOT NULL CHECK (match_type IN ('solo', 'trio', 'chaos')),
                     match_id INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
-            print("  ✅ Toutes les tables dual créées")
+            print("  ✅ Toutes les tables triple créées")
             
-            # MIGRATION COLONNES DODGES ET MATCH_HISTORY SI NÉCESSAIRES
+            # MIGRATION COLONNES EXISTANTES POUR INCLURE CHAOS
             try:
-                c.execute('ALTER TABLE dodges ADD COLUMN dodge_type TEXT DEFAULT \'solo\' CHECK (dodge_type IN (\'solo\', \'trio\'))')
-                print("  ➤ Colonne dodge_type ajoutée")
+                c.execute('ALTER TABLE dodges DROP CONSTRAINT IF EXISTS dodges_dodge_type_check')
+                c.execute("ALTER TABLE dodges ADD CONSTRAINT dodges_dodge_type_check CHECK (dodge_type IN ('solo', 'trio', 'chaos'))")
+                print("  ➤ Contrainte dodges mise à jour")
             except:
                 pass
             
             try:
-                c.execute('ALTER TABLE match_history ADD COLUMN match_type TEXT DEFAULT \'solo\' CHECK (match_type IN (\'solo\', \'trio\'))')
-                print("  ➤ Colonne match_type ajoutée")
+                c.execute('ALTER TABLE match_history DROP CONSTRAINT IF EXISTS match_history_match_type_check')
+                c.execute("ALTER TABLE match_history ADD CONSTRAINT match_history_match_type_check CHECK (match_type IN ('solo', 'trio', 'chaos'))")
+                print("  ➤ Contrainte match_history mise à jour")
             except:
                 pass
             
             try:
-                c.execute('ALTER TABLE match_messages ADD COLUMN match_type TEXT DEFAULT \'solo\' CHECK (match_type IN (\'solo\', \'trio\'))')
-                print("  ➤ Colonne match_type ajoutée aux messages")
+                c.execute('ALTER TABLE match_messages DROP CONSTRAINT IF EXISTS match_messages_match_type_check')
+                c.execute("ALTER TABLE match_messages ADD CONSTRAINT match_messages_match_type_check CHECK (match_type IN ('solo', 'trio', 'chaos'))")
+                print("  ➤ Contrainte match_messages mise à jour")
             except:
                 pass
             
@@ -342,10 +363,11 @@ def init_db():
             print("=" * 50)
             print("✅ MIGRATION COMPLÈTE TERMINÉE")
             print("🥇 Système Solo opérationnel")
-            print("💥 Système Trio opérationnel")
-            print("🚫 ELO complètement séparés")
+            print("👥 Système Trio opérationnel")
+            print("🎲 Système Chaos opérationnel")
+            print("🚫 ELO complètement séparés (3 classements)")
             
-            logger.info("Base de données dual complètement migrée")
+            logger.info("Base de données triple complètement migrée")
             
     except Exception as e:
         logger.error(f"Erreur migration DB: {e}")
@@ -355,7 +377,7 @@ def init_db():
         conn.close()
 
 # ================================
-# FONCTIONS DATABASE DUAL
+# FONCTIONS DATABASE TRIPLE
 # ================================
 
 def get_player(discord_id):
@@ -397,7 +419,7 @@ def create_player(discord_id, name):
         conn.close()
 
 def update_player_elo(discord_id, new_elo, won, match_type):
-    """Met à jour l'ELO d'un joueur avec win/loss selon le type"""
+    """Met à jour l'ELO d'un joueur avec win/loss selon le type (solo/trio/chaos)"""
     conn = get_connection()
     if not conn:
         return False
@@ -417,7 +439,7 @@ def update_player_elo(discord_id, new_elo, won, match_type):
                         SET solo_elo = %s, solo_losses = solo_losses + 1 
                         WHERE discord_id = %s
                     ''', (new_elo, str(discord_id)))
-            else:  # trio
+            elif match_type == 'trio':
                 if won:
                     c.execute('''
                         UPDATE players 
@@ -430,6 +452,21 @@ def update_player_elo(discord_id, new_elo, won, match_type):
                         SET trio_elo = %s, trio_losses = trio_losses + 1 
                         WHERE discord_id = %s
                     ''', (new_elo, str(discord_id)))
+            elif match_type == 'chaos':
+                if won:
+                    c.execute('''
+                        UPDATE players 
+                        SET chaos_elo = COALESCE(chaos_elo, 1000) + (%s - COALESCE(chaos_elo, 1000)), 
+                            chaos_wins = COALESCE(chaos_wins, 0) + 1 
+                        WHERE discord_id = %s
+                    ''', (new_elo, str(discord_id)))
+                else:
+                    c.execute('''
+                        UPDATE players 
+                        SET chaos_elo = COALESCE(chaos_elo, 1000) + (%s - COALESCE(chaos_elo, 1000)), 
+                            chaos_losses = COALESCE(chaos_losses, 0) + 1 
+                        WHERE discord_id = %s
+                    ''', (new_elo, str(discord_id)))
             conn.commit()
             return True
     except Exception as e:
@@ -439,7 +476,7 @@ def update_player_elo(discord_id, new_elo, won, match_type):
         conn.close()
 
 def get_leaderboard(match_type='solo'):
-    """Récupère le classement selon le type"""
+    """Récupère le classement selon le type (solo/trio/chaos)"""
     conn = get_connection()
     if not conn:
         return []
@@ -448,8 +485,13 @@ def get_leaderboard(match_type='solo'):
         with conn.cursor() as c:
             if match_type == 'solo':
                 c.execute('SELECT * FROM players ORDER BY solo_elo DESC LIMIT 20')
-            else:
+            elif match_type == 'trio':
                 c.execute('SELECT * FROM players ORDER BY trio_elo DESC LIMIT 20')
+            elif match_type == 'chaos':
+                c.execute('SELECT * FROM players ORDER BY COALESCE(chaos_elo, 1000) DESC LIMIT 20')
+            else:
+                return []
+            
             results = c.fetchall()
             return [dict(row) for row in results] if results else []
     except Exception as e:
@@ -589,11 +631,11 @@ def delete_trio_team(team_id):
         conn.close()
 
 # ================================
-# FONCTIONS LOBBY DUAL
+# FONCTIONS LOBBY TRIPLE
 # ================================
 
 def check_lobby_limits(lobby_type):
-    """Vérifie les limites selon le type"""
+    """Vérifie les limites selon le type (solo/trio/chaos)"""
     conn = get_connection()
     if not conn:
         return False, "Erreur de connexion"
@@ -604,14 +646,25 @@ def check_lobby_limits(lobby_type):
             c.execute('SELECT COUNT(*) as count FROM lobbies WHERE lobby_type = %s', (lobby_type,))
             lobby_count = c.fetchone()['count']
             
-            max_lobbies = MAX_CONCURRENT_LOBBIES_SOLO if lobby_type == 'solo' else MAX_CONCURRENT_LOBBIES_TRIO
+            if lobby_type == 'solo':
+                max_lobbies = MAX_CONCURRENT_LOBBIES_SOLO
+                cooldown_minutes = LOBBY_COOLDOWN_MINUTES_SOLO
+                cooldown_id = 1
+            elif lobby_type == 'trio':
+                max_lobbies = MAX_CONCURRENT_LOBBIES_TRIO
+                cooldown_minutes = LOBBY_COOLDOWN_MINUTES_TRIO
+                cooldown_id = 2
+            elif lobby_type == 'chaos':
+                max_lobbies = MAX_CONCURRENT_LOBBIES_CHAOS
+                cooldown_minutes = LOBBY_COOLDOWN_MINUTES_CHAOS
+                cooldown_id = 3
+            else:
+                return False, "Type de lobby inconnu"
+            
             if lobby_count >= max_lobbies:
                 return False, f"Limite atteinte: {max_lobbies} lobbies {lobby_type} maximum"
             
             # Vérifier le cooldown
-            cooldown_id = 1 if lobby_type == 'solo' else 2
-            cooldown_minutes = LOBBY_COOLDOWN_MINUTES_SOLO if lobby_type == 'solo' else LOBBY_COOLDOWN_MINUTES_TRIO
-            
             c.execute('SELECT last_creation FROM lobby_cooldown WHERE id = %s', (cooldown_id,))
             result = c.fetchone()
             
@@ -634,7 +687,7 @@ def check_lobby_limits(lobby_type):
         conn.close()
 
 def create_lobby(room_code, lobby_type):
-    """Crée un lobby selon le type"""
+    """Crée un lobby selon le type (solo/trio/chaos)"""
     can_create, message = check_lobby_limits(lobby_type)
     if not can_create:
         return None, message
@@ -650,7 +703,15 @@ def create_lobby(room_code, lobby_type):
             lobby_id = c.fetchone()['id']
             
             # Mettre à jour le cooldown approprié
-            cooldown_id = 1 if lobby_type == 'solo' else 2
+            if lobby_type == 'solo':
+                cooldown_id = 1
+            elif lobby_type == 'trio':
+                cooldown_id = 2
+            elif lobby_type == 'chaos':
+                cooldown_id = 3
+            else:
+                return None, "Type de lobby inconnu"
+                
             c.execute('UPDATE lobby_cooldown SET last_creation = CURRENT_TIMESTAMP WHERE id = %s', 
                      (cooldown_id,))
             
@@ -674,7 +735,7 @@ async def on_ready():
     print(f'Bot {bot.user} connecté!')
     print(f'Serveurs: {len(bot.guilds)}')
     
-    # Initialiser la base de données dual avec migration complète
+    # Initialiser la base de données triple avec migration complète
     init_db()
     
     # Initialiser le système de backup
@@ -736,10 +797,10 @@ async def on_command_error(ctx, error):
         except Exception as e:
             print(f"[UNKNOWN_ERROR] Erreur inattendue envoi message: {e}")
 
-# Commande help globale
+# Commande help globale mise à jour
 @bot.command(name='help')
-async def help_dual(ctx):
-    message = "🎯 **BOT ELO DUAL - GUIDE**\n\n"
+async def help_triple(ctx):
+    message = "🎯 **BOT ELO TRIPLE - GUIDE COMPLET**\n\n"
     
     message += "🥇 **MODE SOLO**\n"
     message += "• `!solo <code>` - Créer lobby solo\n"
@@ -747,7 +808,7 @@ async def help_dual(ctx):
     message += "• `!elosolo` - Voir son ELO solo\n"
     message += "• `!leaderboardsolo` - Classement solo\n\n"
     
-    message += "💥 **MODE TRIO**\n"
+    message += "👥 **MODE TRIO**\n"
     message += "• `!createteam @j1 @j2 Nom` - Créer équipe\n"
     message += "• `!myteam` - Voir son équipe\n"
     message += "• `!leaveteam` - Dissoudre équipe (capitaine)\n"
@@ -757,9 +818,18 @@ async def help_dual(ctx):
     message += "• `!elotrio` - Voir son ELO trio\n"
     message += "• `!leaderboardtrio` - Classement trio\n\n"
     
+    message += "🎲 **MODE CHAOS**\n"
+    message += "• `!chaos <code>` - Créer lobby chaos\n"
+    message += "• `!joinchaos <id>` - Rejoindre lobby\n"
+    message += "• `!elochaos` - Voir son ELO chaos\n"
+    message += "• `!leaderboardchaos` - Classement chaos\n"
+    message += "• `!chaosinfo` - Guide du mode chaos\n\n"
+    
     message += "🚫 **IMPORTANT:**\n"
-    message += "• ELO Solo et Trio complètement séparés\n"
-    message += "• Pour le trio, créez d'abord votre équipe fixe"
+    message += "• ELO Solo, Trio et Chaos complètement séparés\n"
+    message += "• Pour le trio, créez d'abord votre équipe fixe\n"
+    message += "• Le chaos est 100% aléatoire et fun\n"
+    message += "• 3 classements indépendants"
     
     await ctx.send(message)
 
@@ -783,14 +853,17 @@ async def main():
     try:
         from commands_solo import setup_solo_commands
         from commands_trio import setup_trio_commands
+        from chaos import setup_chaos_commands  # Nouveau module
         
         await setup_solo_commands(bot)
         await setup_trio_commands(bot)
+        await setup_chaos_commands(bot)  # Nouveau
         
-        print("Bot ELO Dual démarré avec modules séparés:")
+        print("Bot ELO Triple démarré avec modules séparés:")
         print("🥇 Module SOLO - Matchmaking individuel")
-        print("💥 Module TRIO - Équipes fixes de 3 joueurs")
-        print("🚫 ELO et classements complètement séparés")
+        print("👥 Module TRIO - Équipes fixes de 3 joueurs")
+        print("🎲 Module CHAOS - Mode aléatoire et fun")
+        print("🚫 3 ELO et classements complètement séparés")
         print("📁 Architecture modulaire pour maintenance facilitée")
         
     except ImportError as e:
