@@ -82,12 +82,7 @@ CHAOS_BRAWLERS = [
 # Modificateurs Null's Brawl
 CHAOS_MODIFIERS = [
     "Vitesse x2", "Dégâts x2", "Santé x2", "Rechargement Rapide", 
-    "Super Charge Rapide", "Invisibilité Aléatoire", "Bouclier Permanent",
-    "Projectiles qui Rebondissent", "Dégâts de Zone", "Guérison Continue",
-    "Téléportation Aléatoire", "Gravité Réduite", "Taille Géante",
-    "Taille Miniature", "Missiles qui Suivent", "Explosion à la Mort",
-    "Double Saut", "Murs qui Bougent", "Sol de Lave", "Brouillard de Guerre",
-    "Boost d'Énergie", "Vision Nocturne", "Rage Mode", "Chaos Total"
+    "Super Charge Rapide", "Invisibilité Aléatoire", "Bouclier Permanent", "Brouillard de Guerre"
 ]
 
 def get_connection():
