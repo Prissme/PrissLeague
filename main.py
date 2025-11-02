@@ -467,7 +467,7 @@ async def queue_solo(ctx: commands.Context):
     await ctx.send("\n".join(lines) if lines else "Aucune file en cours.")
 
 
-@bot.command(name="elosolo")
+@bot.command(name="elosolo", aliases=["elo"])
 async def elo_solo(ctx: commands.Context, member: Optional[discord.Member] = None):
     target = member or ctx.author
     player = fetch_player(target.id)
