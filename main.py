@@ -18,6 +18,8 @@ import psycopg2
 from discord.ext import commands
 from psycopg2.extras import RealDictCursor
 
+from smart_migration import ensure_players_schema
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
@@ -69,33 +71,7 @@ def init_db() -> None:
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS players (
-                    discord_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    division TEXT NOT NULL DEFAULT 'division2',
-                    solo_elo INTEGER NOT NULL DEFAULT 1000,
-                    solo_wins INTEGER NOT NULL DEFAULT 0,
-                    solo_losses INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
-                )
-                """
-            )
-
-            # Ensure expected columns exist for legacy databases
-            cursor.execute(
-                "ALTER TABLE players ADD COLUMN IF NOT EXISTS division TEXT NOT NULL DEFAULT 'division2'"
-            )
-            cursor.execute(
-                "ALTER TABLE players ADD COLUMN IF NOT EXISTS solo_elo INTEGER NOT NULL DEFAULT 1000"
-            )
-            cursor.execute(
-                "ALTER TABLE players ADD COLUMN IF NOT EXISTS solo_wins INTEGER NOT NULL DEFAULT 0"
-            )
-            cursor.execute(
-                "ALTER TABLE players ADD COLUMN IF NOT EXISTS solo_losses INTEGER NOT NULL DEFAULT 0"
-            )
+            ensure_players_schema(cursor)
 
             cursor.execute(
                 """
