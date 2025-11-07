@@ -35,6 +35,39 @@ QUEUE_TARGET_SIZE = 6  # 3v3
 MATCH_CHANNEL_ID = 1434509931360419890
 LOG_CHANNEL_ID = 1237166689188053023
 
+MAP_ROTATION = [
+    {
+        "mode": "Razzia de gemmes",
+        "emoji": "<:GemGrab:1436473738765008976>",
+        "maps": ["Mine hard-rock", "Tunnel de mine", "Bruissements"],
+    },
+    {
+        "mode": "Brawlball",
+        "emoji": "<:Brawlball:1436473735573143562>",
+        "maps": ["Tir au buts", "Super plage", "Triple Dribble"],
+    },
+    {
+        "mode": "Hors-jeu",
+        "emoji": "<:KnockOut:1436473703083937914>",
+        "maps": ["Rocher de la belle", "Ravin du bras d'or", "À découvert"],
+    },
+    {
+        "mode": "Braquage",
+        "emoji": "<:Heist:1436473730812481546>",
+        "maps": ["C'est chaud patate", "Arrêt au stand", "Zone sécurisée"],
+    },
+    {
+        "mode": "Zone réservée",
+        "emoji": "<:HotZone:1436473698491175137>",
+        "maps": ["Duel de scarabées", "Cercle de feu", "Stratégies parallèles"],
+    },
+    {
+        "mode": "Prime",
+        "emoji": "<:Bounty:1436473727519948962>",
+        "maps": ["Cachette secrète", "Étoile filante", "Mille-feuille"],
+    },
+]
+
 DIVISION_ONE_ROLE_IDS = {
     1382754272415846552,
     1427036443599179837,
@@ -500,6 +533,22 @@ async def create_match_if_possible(ctx: commands.Context, division: str) -> None
     message_lines.append(f"🔗 https://link.nulls.gg/nb/invite/gameroom/fr?tag={room_code}")
 
     view = MatchVoteView(match_id, team1_ids, team2_ids)
+    selected_modes = random.sample(MAP_ROTATION, k=min(3, len(MAP_ROTATION)))
+    picked_maps = [
+        (
+            mode_info["mode"],
+            random.choice(mode_info["maps"]),
+            mode_info["emoji"],
+        )
+        for mode_info in selected_modes
+    ]
+
+    if picked_maps:
+        message_lines.append("")
+        message_lines.append("🗺️ **Maps à jouer**")
+        for mode_name, map_name, emoji in picked_maps:
+            message_lines.append(f"• {emoji} {mode_name} : {map_name}")
+
     await send_match_message(guild, "\n".join(message_lines), view=view)
 
     log_channel = guild.get_channel(LOG_CHANNEL_ID)
@@ -591,6 +640,18 @@ async def queue(ctx: commands.Context):
             lines.append("")
 
     await ctx.send("\n".join(lines) if lines else "Aucune file en cours.")
+
+
+@bot.command(name="maps")
+async def maps_command(ctx: commands.Context):
+    lines = ["🗺️ **Rotation des maps disponibles**", ""]
+    for mode_info in MAP_ROTATION:
+        emoji = mode_info["emoji"]
+        mode = mode_info["mode"]
+        maps = ", ".join(mode_info["maps"])
+        lines.append(f"{emoji} **{mode}** : {maps}")
+
+    await ctx.send("\n".join(lines))
 
 
 @bot.command(name="elo")
