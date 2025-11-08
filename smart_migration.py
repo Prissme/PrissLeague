@@ -181,6 +181,24 @@ def ensure_players_schema(cursor) -> None:
         )
         cursor.execute("ALTER TABLE players ALTER COLUMN discord_id SET NOT NULL")
 
+    # Handle legacy display_name column
+    if "display_name" in info:
+        if "name" not in info:
+            log("Renaming legacy column 'display_name' to 'name'.")
+            cursor.execute("ALTER TABLE players RENAME COLUMN display_name TO name")
+            info["name"] = info.pop("display_name")
+        else:
+            log("Migrating values from legacy column 'display_name' into 'name'.")
+            cursor.execute(
+                """
+                UPDATE players
+                SET name = display_name
+                WHERE (name IS NULL OR name = '') AND display_name IS NOT NULL
+                """
+            )
+            cursor.execute("ALTER TABLE players DROP COLUMN display_name")
+            info.pop("display_name", None)
+
     # Ensure name column exists
     if "name" not in info:
         log("Adding missing column 'name'.")
