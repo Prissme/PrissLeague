@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Solo matchmaking bot with division support."""
+"""Solo matchmaking bot."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import random
-import string
 from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -68,17 +67,7 @@ MAP_ROTATION = [
     },
 ]
 
-DIVISION_ONE_ROLE_IDS = {
-    1382754272415846552,
-    1427036443599179837,
-    1382755128955637790,
-    1429940014036553899,
-    1382755717781524590,
-}
-DIVISION_LABELS = {
-    "division1": "Division 1",
-    "division2": "Division 2",
-}
+DEFAULT_DIVISION = "solo"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -87,7 +76,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 queue_lock = asyncio.Lock()
 vote_lock = asyncio.Lock()
-solo_queues: Dict[str, List[int]] = {"division1": [], "division2": []}
+solo_queue: List[int] = []
 match_votes: Dict[int, Dict[int, str]] = {}
 
 # ----------------------------------------------------------------------------
@@ -165,19 +154,7 @@ def calculate_elo_change(player_elo: float, opponent_avg_elo: float, won: bool) 
     return round(change)
 
 
-def generate_room_code(length: int = 6) -> str:
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(random.choices(alphabet, k=length))
-
-
-def determine_division(member: discord.Member) -> str:
-    member_role_ids = {role.id for role in getattr(member, "roles", [])}
-    if member_role_ids & DIVISION_ONE_ROLE_IDS:
-        return "division1"
-    return "division2"
-
-
-def ensure_player(discord_id: int, name: str, division: str) -> Player:
+def ensure_player(discord_id: int, name: str, division: str = DEFAULT_DIVISION) -> Player:
     """Create or update the player with the correct division."""
     conn = get_connection()
     try:
@@ -229,8 +206,8 @@ def fetch_player(discord_id: int) -> Optional[Player]:
 def record_match(
     team1_ids: Sequence[int],
     team2_ids: Sequence[int],
-    room_code: str,
-    division: str,
+    room_code: str = "N/A",
+    division: str = DEFAULT_DIVISION,
 ) -> int:
     conn = get_connection()
     try:
@@ -318,8 +295,8 @@ def apply_player_updates(updates: Iterable[Tuple[int, int, bool]]) -> None:
         conn.close()
 
 
-def format_queue_position(division: str) -> str:
-    return f"{len(solo_queues[division])}/{QUEUE_TARGET_SIZE} joueurs dans la file {DIVISION_LABELS[division]}"
+def format_queue_position() -> str:
+    return f"{len(solo_queue)}/{QUEUE_TARGET_SIZE} joueurs dans la file solo"
 
 
 def describe_team(title: str, team_players: List[Player]) -> List[str]:
@@ -356,20 +333,14 @@ def finalize_match_result(
     for pid in missing_ids:
         member = guild.get_member(pid) if guild else None
         name = member.display_name if member else f"Joueur {pid}"
-        division = (
-            determine_division(member)
-            if member and isinstance(member, discord.Member)
-            else match["division"]
-        )
-        player_map[pid] = ensure_player(pid, name, division)
+        player_map[pid] = ensure_player(pid, name)
 
     winner_avg = sum(player_map[pid].solo_elo for pid in winning_ids) / 3
     loser_avg = sum(player_map[pid].solo_elo for pid in losing_ids) / 3
 
     updates: List[Tuple[int, int, bool]] = []
     summary_lines = [
-        f"✅ Match solo #{match_id} confirmé ({DIVISION_LABELS[match['division']]}) : "
-        f"victoire équipe {winner_label}!"
+        f"✅ Match solo #{match_id} confirmé : victoire équipe {winner_label}!"
     ]
     summary_lines.append("🔵 Équipe Bleue :")
     for pid in team1_ids:
@@ -485,17 +456,17 @@ async def send_match_message(
     await channel.send(content, view=view)
 
 
-async def create_match_if_possible(ctx: commands.Context, division: str) -> None:
+async def create_match_if_possible(ctx: commands.Context) -> None:
     guild = ctx.guild
     if guild is None:
         return
 
     async with queue_lock:
-        queue_snapshot = list(solo_queues[division])
+        queue_snapshot = list(solo_queue)
         if len(queue_snapshot) < QUEUE_TARGET_SIZE:
             return
         selected_ids = queue_snapshot[:QUEUE_TARGET_SIZE]
-        solo_queues[division] = queue_snapshot[QUEUE_TARGET_SIZE:]
+        del solo_queue[:QUEUE_TARGET_SIZE]
 
     players = fetch_players(selected_ids)
     player_map: Dict[int, Player] = {player.discord_id: player for player in players}
@@ -506,8 +477,7 @@ async def create_match_if_possible(ctx: commands.Context, division: str) -> None
         logger.warning("Missing player %s in database, creating default entry", pid)
         member = guild.get_member(pid)
         name = member.display_name if member else f"Joueur {pid}"
-        division_override = determine_division(member) if member else "division2"
-        player = ensure_player(pid, name, division_override)
+        player = ensure_player(pid, name)
         player_map[pid] = player
 
     sorted_ids = sorted(selected_ids, key=lambda pid: player_map[pid].solo_elo)
@@ -516,22 +486,16 @@ async def create_match_if_possible(ctx: commands.Context, division: str) -> None
     team1_players = [player_map[pid] for pid in team1_ids]
     team2_players = [player_map[pid] for pid in team2_ids]
 
-    room_code = generate_room_code()
-    match_id = record_match(team1_ids, team2_ids, room_code, division)
+    match_id = record_match(team1_ids, team2_ids)
 
     message_lines = [
-        f"🎮 **Match Solo #{match_id} - {DIVISION_LABELS[division]}**",
-        f"Code Null's Brawl : `{room_code}`",
-        "Créez la room via `/room` en complétant le code ci-dessus.",
+        f"🎮 **Match Solo #{match_id}**",
         "Votez pour l'équipe gagnante avec les boutons ci-dessous.",
         "",
     ]
     message_lines.extend(describe_team("🔵 Équipe Bleue", team1_players))
     message_lines.append("")
     message_lines.extend(describe_team("🔴 Équipe Rouge", team2_players))
-    message_lines.append("")
-    message_lines.append(f"🔗 https://link.nulls.gg/nb/invite/gameroom/fr?tag={room_code}")
-
     view = MatchVoteView(match_id, team1_ids, team2_ids)
     selected_modes = random.sample(MAP_ROTATION, k=min(3, len(MAP_ROTATION)))
     picked_maps = [
@@ -554,7 +518,7 @@ async def create_match_if_possible(ctx: commands.Context, division: str) -> None
     log_channel = guild.get_channel(LOG_CHANNEL_ID)
     if log_channel:
         await log_channel.send(
-            f"📝 Nouveau match Solo #{match_id} généré pour {DIVISION_LABELS[division]}."
+            f"📝 Nouveau match Solo #{match_id} généré."
         )
 
 
@@ -575,31 +539,24 @@ async def join(ctx: commands.Context):
         await ctx.send("❌ Cette commande doit être utilisée dans un serveur.")
         return
 
-    division = determine_division(member)
-    player = ensure_player(member.id, member.display_name, division)
+    player = ensure_player(member.id, member.display_name)
 
     async with queue_lock:
-        existing_division: Optional[str] = None
-        for div, queue in solo_queues.items():
-            if member.id in queue:
-                existing_division = div
-                break
-
-        if existing_division:
+        if member.id in solo_queue:
             await ctx.send(
-                f"{member.mention} est déjà dans la file solo {DIVISION_LABELS[existing_division]}. "
-                f"({format_queue_position(existing_division)})"
+                f"{member.mention} est déjà dans la file solo. "
+                f"({format_queue_position()})"
             )
             return
 
-        solo_queues[division].append(member.id)
-        position = len(solo_queues[division])
+        solo_queue.append(member.id)
+        position = len(solo_queue)
 
     await ctx.send(
-        f"✅ {member.mention} rejoint la file solo {DIVISION_LABELS[division]} (ELO {player.solo_elo}). "
+        f"✅ {member.mention} rejoint la file solo (ELO {player.solo_elo}). "
         f"Position : {position}/{QUEUE_TARGET_SIZE}."
     )
-    await create_match_if_possible(ctx, division)
+    await create_match_if_possible(ctx)
 
 
 @bot.command(name="leave")
@@ -608,11 +565,9 @@ async def leave(ctx: commands.Context):
     removed = False
 
     async with queue_lock:
-        for queue in solo_queues.values():
-            if member.id in queue:
-                queue.remove(member.id)
-                removed = True
-                break
+        if member.id in solo_queue:
+            solo_queue.remove(member.id)
+            removed = True
 
     if removed:
         await ctx.send(f"👋 {member.mention} quitte la file solo.")
@@ -624,20 +579,20 @@ async def leave(ctx: commands.Context):
 async def queue(ctx: commands.Context):
     lines: List[str] = []
     async with queue_lock:
-        for division, queue in solo_queues.items():
-            if not queue:
-                lines.append(f"📋 **{DIVISION_LABELS[division]}** : file vide")
-                continue
+        queue_snapshot = list(solo_queue)
 
-            players = fetch_players(queue)
-            player_map = {player.discord_id: player for player in players}
+    if not queue_snapshot:
+        lines.append("📋 **File Solo** : file vide")
+    else:
+        players = fetch_players(queue_snapshot)
+        player_map = {player.discord_id: player for player in players}
 
-            lines.append(f"📋 **File {DIVISION_LABELS[division]}**")
-            for index, discord_id in enumerate(queue, start=1):
-                player = player_map.get(discord_id)
-                elo = player.solo_elo if player else 1000
-                lines.append(f"{index}. <@{discord_id}> ({elo} ELO)")
-            lines.append("")
+        lines.append("📋 **File Solo**")
+        for index, discord_id in enumerate(queue_snapshot, start=1):
+            player = player_map.get(discord_id)
+            elo = player.solo_elo if player else 1000
+            lines.append(f"{index}. <@{discord_id}> ({elo} ELO)")
+        lines.append("")
 
     await ctx.send("\n".join(lines) if lines else "Aucune file en cours.")
 
@@ -659,14 +614,13 @@ async def elo_command(ctx: commands.Context, member: Optional[discord.Member] = 
     target = member or ctx.author
     player = fetch_player(target.id)
     if not player:
-        division = determine_division(target) if isinstance(target, discord.Member) else "division2"
-        player = ensure_player(target.id, target.display_name, division)
+        player = ensure_player(target.id, target.display_name)
 
     total_games = player.solo_wins + player.solo_losses
     win_rate = (player.solo_wins / total_games * 100) if total_games else 0.0
 
     await ctx.send(
-        f"📊 ELO Solo de {target.mention} ({DIVISION_LABELS[player.division]}) : {player.solo_elo} "
+        f"📊 ELO Solo de {target.mention} : {player.solo_elo} "
         f"({player.solo_wins} victoires / {player.solo_losses} défaites, {win_rate:.1f}% WR)"
     )
 
@@ -690,8 +644,7 @@ async def reset_stats(ctx: commands.Context):
         conn.close()
 
     async with queue_lock:
-        for queue in solo_queues.values():
-            queue.clear()
+        solo_queue.clear()
 
     await ctx.send("♻️ Toutes les statistiques des joueurs ont été réinitialisées.")
 
@@ -708,7 +661,7 @@ async def reset_stats_error(ctx: commands.Context, error: commands.CommandError)
 async def help_command(ctx: commands.Context):
     lines = [
         "🤖 **Commandes Matchmaking Solo**",
-        "• `!join` – Rejoindre la file 3v3 de votre division",
+        "• `!join` – Rejoindre la file 3v3",
         "• `!leave` – Quitter la file",
         "• `!queue` – Voir les files actuelles",
         "• `!elo [@joueur]` – Voir l'ELO solo",
