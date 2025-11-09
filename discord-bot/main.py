@@ -29,11 +29,11 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-QUEUE_TARGET_SIZE = 6  # 3v3
+QUEUE_TARGET_SIZE = int(os.getenv("QUEUE_TARGET_SIZE", "6"))  # 3v3
 
-MATCH_CHANNEL_ID = 1434509931360419890
-LOG_CHANNEL_ID = 1237166689188053023
-PING_ROLE_ID = 1437211411096010862
+MATCH_CHANNEL_ID = int(os.getenv("MATCH_CHANNEL_ID", "1434509931360419890"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "1237166689188053023"))
+PING_ROLE_ID = int(os.getenv("PING_ROLE_ID", "1437211411096010862"))
 
 MAP_ROTATION = [
     {
@@ -68,7 +68,7 @@ MAP_ROTATION = [
     },
 ]
 
-DEFAULT_DIVISION = "solo"
+DEFAULT_DIVISION = os.getenv("MATCHMAKING_DEFAULT_DIVISION", "solo")
 
 intents = discord.Intents.default()
 intents.message_content = True
