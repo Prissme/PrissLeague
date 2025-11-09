@@ -33,6 +33,7 @@ QUEUE_TARGET_SIZE = 6  # 3v3
 
 MATCH_CHANNEL_ID = 1434509931360419890
 LOG_CHANNEL_ID = 1237166689188053023
+PING_ROLE_ID = 1437211411096010862
 
 MAP_ROTATION = [
     {
@@ -267,6 +268,23 @@ def complete_match(match_id: int, winner: str) -> None:
         conn.close()
 
 
+def cancel_match(match_id: int) -> None:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE solo_matches
+                SET status = 'cancelled', winner = NULL, completed_at = NOW()
+                WHERE id = %s
+                """,
+                (match_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def apply_player_updates(updates: Iterable[Tuple[int, int, bool]]) -> None:
     conn = get_connection()
     try:
@@ -323,6 +341,9 @@ def finalize_match_result(
     elif winner_label == "rouge":
         winning_ids = team2_ids
         losing_ids = team1_ids
+    elif winner_label == "annulee":
+        winning_ids = team1_ids
+        losing_ids = team2_ids
     else:
         raise ValueError(f"Winner label '{winner_label}' invalide")
 
@@ -335,13 +356,7 @@ def finalize_match_result(
         name = member.display_name if member else f"Joueur {pid}"
         player_map[pid] = ensure_player(pid, name)
 
-    winner_avg = sum(player_map[pid].solo_elo for pid in winning_ids) / 3
-    loser_avg = sum(player_map[pid].solo_elo for pid in losing_ids) / 3
-
-    updates: List[Tuple[int, int, bool]] = []
-    summary_lines = [
-        f"✅ Match solo #{match_id} confirmé : victoire équipe {winner_label}!"
-    ]
+    summary_lines: List[str] = []
     summary_lines.append("🔵 Équipe Bleue :")
     for pid in team1_ids:
         player = player_map[int(pid)]
@@ -351,6 +366,23 @@ def finalize_match_result(
         player = player_map[int(pid)]
         summary_lines.append(f"- <@{player.discord_id}> ({player.solo_elo} ELO)")
     summary_lines.append("")
+
+    if winner_label == "annulee":
+        cancel_match(match_id)
+        summary_lines.insert(0, f"⚠️ Match solo #{match_id} annulé par vote des joueurs.")
+        return "\n".join(summary_lines)
+
+    winner_avg = sum(player_map[pid].solo_elo for pid in winning_ids) / max(
+        1, len(winning_ids)
+    )
+    loser_avg = sum(player_map[pid].solo_elo for pid in losing_ids) / max(
+        1, len(losing_ids)
+    )
+
+    updates: List[Tuple[int, int, bool]] = []
+    summary_lines.insert(
+        0, f"✅ Match solo #{match_id} confirmé : victoire équipe {winner_label}!"
+    )
 
     for pid in winning_ids:
         player = player_map[pid]
@@ -443,6 +475,14 @@ class MatchVoteView(discord.ui.View):
     ) -> None:
         await self._register_vote(interaction, "rouge")
 
+    @discord.ui.button(
+        label="Game annulée", style=discord.ButtonStyle.secondary, emoji="🚫"
+    )
+    async def vote_cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._register_vote(interaction, "annulee")
+
 
 async def send_match_message(
     guild: discord.Guild, content: str, view: Optional[discord.ui.View] = None
@@ -530,6 +570,34 @@ async def create_match_if_possible(ctx: commands.Context) -> None:
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
+
+
+@bot.command(name="ping")
+async def ping_role(ctx: commands.Context):
+    guild = ctx.guild
+    member = ctx.author
+
+    if guild is None or not isinstance(member, discord.Member):
+        await ctx.send("❌ Cette commande doit être utilisée dans un serveur.")
+        return
+
+    role = guild.get_role(PING_ROLE_ID)
+    if role is None:
+        await ctx.send(
+            "❌ Le rôle de notification n'est pas configuré. Contactez un administrateur."
+        )
+        return
+
+    if role in member.roles:
+        await member.remove_roles(role, reason="Désinscription ping matchmaking solo")
+        await ctx.send(
+            f"🔕 {member.mention} ne recevra plus les notifications de nouveaux lobbys."
+        )
+    else:
+        await member.add_roles(role, reason="Inscription ping matchmaking solo")
+        await ctx.send(
+            f"🔔 {member.mention} recevra désormais les notifications de nouveaux lobbys."
+        )
 
 
 @bot.command(name="join")
@@ -664,6 +732,7 @@ async def help_command(ctx: commands.Context):
         "• `!join` – Rejoindre la file 3v3",
         "• `!leave` – Quitter la file",
         "• `!queue` – Voir les files actuelles",
+        "• `!ping` – Activer ou désactiver les notifications de nouveaux lobbys",
         "• `!elo [@joueur]` – Voir l'ELO solo",
         "• Votez pour le vainqueur grâce aux boutons du match",
         "• `!resetstats` – Réinitialiser toutes les stats (administrateurs)",
