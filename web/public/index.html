@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PrissLeague - Classement Solo</title>
+    <link rel="stylesheet" href="https://unpkg.com/mvp.css" />
+    <style>
+      body {
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 2rem 1.5rem 4rem;
+      }
+      header {
+        text-align: center;
+        margin-bottom: 2rem;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #1e293b;
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      th,
+      td {
+        padding: 0.75rem 1rem;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      .badge {
+        padding: 0.25rem 0.75rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        background: #f97316;
+        color: #0f172a;
+      }
+      footer {
+        text-align: center;
+        margin-top: 3rem;
+        opacity: 0.7;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>PrissLeague</h1>
+        <p>Classement Solo Top 50 - mis à jour en temps réel</p>
+        <p id="last-update" class="badge">Chargement...</p>
+      </header>
+
+      <section>
+        <table id="leaderboard">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Joueur</th>
+              <th>ELO</th>
+              <th>Victoires</th>
+              <th>Défaites</th>
+              <th>Winrate</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td colspan="6" style="text-align: center">Chargement du classement...</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <footer>
+        <p>
+          Propulsé par Supabase &amp; Discord. Panel admin disponible sur
+          <code>/admin</code> (auth requise).
+        </p>
+      </footer>
+    </main>
+
+    <script>
+      async function fetchLeaderboard() {
+        const response = await fetch('/api/leaderboard');
+        if (!response.ok) {
+          throw new Error('Impossible de récupérer le classement');
+        }
+        return response.json();
+      }
+
+      function renderLeaderboard(players) {
+        const tbody = document.querySelector('#leaderboard tbody');
+        tbody.innerHTML = '';
+        if (!players.length) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align:center">Aucun joueur pour le moment.</td></tr>';
+          return;
+        }
+
+        players.forEach((player, index) => {
+          const totalGames = (player.solo_wins || 0) + (player.solo_losses || 0);
+          const winRate = totalGames ? ((player.solo_wins / totalGames) * 100).toFixed(1) : '0.0';
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${index + 1}</td>
+            <td>${player.name ?? 'Inconnu'}</td>
+            <td>${player.solo_elo ?? 0}</td>
+            <td>${player.solo_wins ?? 0}</td>
+            <td>${player.solo_losses ?? 0}</td>
+            <td>${winRate}%</td>
+          `;
+          tbody.appendChild(tr);
+        });
+      }
+
+      async function init() {
+        try {
+          const data = await fetchLeaderboard();
+          renderLeaderboard(data.players || []);
+          document.getElementById('last-update').textContent = new Date().toLocaleString('fr-FR');
+        } catch (error) {
+          document.querySelector('#leaderboard tbody').innerHTML = `<tr><td colspan="6" style="text-align:center;color:#f87171">${error.message}</td></tr>`;
+        }
+      }
+
+      init();
+      setInterval(init, 60_000);
+    </script>
+  </body>
+</html>

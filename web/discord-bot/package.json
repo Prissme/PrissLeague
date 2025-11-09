@@ -1,0 +1,20 @@
+{
+  "name": "prissleague-role-sync-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
+  "description": "Bot Discord Node.js synchronisant les rôles de tier avec Supabase.",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.1",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}
